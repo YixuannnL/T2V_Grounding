@@ -1,0 +1,56 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# test_scene_consistency: 单场景多分镜 · 场景一致性测试
+#
+# 测试目标:
+#   - loc_cafe 在 Shot 1 由 T2V 建立，Shot 2-5 复用同一场景参考
+#   - char_maya 在 Shot 1 建立外观，后续镜头保持一致
+#   - 场景不变，人物动作、镜头景别持续变化
+#
+# 难点:
+#   - Shot 1 T2V 生成咖啡馆场景，grounding 提取背景 reference
+#   - Shot 2-5 Phantom 用 [char_maya_crop, loc_cafe_bg] 生成，验证场景保持
+#   - 镜头景别从全景→中景→近景→特写→全景回归，考验各景别下场景线索一致性
+# ──────────────────────────────────────────────────────────────────────────────
+
+shots:
+  - shot_id: 1
+    text: >
+      Wide shot. Maya, a woman in her late 20s with curly red hair and a
+      dark green turtleneck sweater, enters a cozy vintage coffee shop.
+      The shop has exposed brick walls, hanging Edison bulbs, wooden tables,
+      and a long counter with a classic espresso machine. Warm afternoon
+      light streams through large front windows.
+    duration_seconds: 3.5
+
+  - shot_id: 2
+    text: >
+      Medium shot. Maya sits down at a small wooden table near the window
+      of the coffee shop. She places her canvas bag on the chair beside her
+      and pulls out a notebook. The Edison bulbs glow warmly above her.
+      The brick walls and espresso counter are visible in the background.
+    duration_seconds: 3.5
+
+  - shot_id: 3
+    text: >
+      Close-up shot. Maya leans over her notebook, writing intently.
+      A ceramic coffee cup steams beside her hand on the wooden table.
+      Soft warm light from the window catches her red curly hair.
+      The blurred background shows the coffee shop interior.
+    duration_seconds: 3.0
+
+  - shot_id: 4
+    text: >
+      Medium close-up. Maya looks up from her notebook and stares out
+      the large front window of the coffee shop, lost in thought.
+      Reflections of the street are faintly visible in the glass.
+      The wooden table and her coffee cup are in the foreground.
+    duration_seconds: 3.0
+
+  - shot_id: 5
+    text: >
+      Wide shot. Maya gathers her notebook and bag, stands up from
+      the wooden table, and walks toward the door of the coffee shop.
+      Other patrons sit at nearby tables. The espresso machine gleams
+      on the counter. Edison bulbs hang from the ceiling. She pushes
+      open the door and a shaft of afternoon light floods in.
+    duration_seconds: 4.0

@@ -1,0 +1,47 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# test_sniper_standoff: global_caption + 5 shots
+# 测试目标:
+#   ① global_caption 预建实体图谱（char_bearded_man / char_masked_figure / loc_desert）
+#   ② 各 shot 用简短指代（"the man"、"the armed man"）能正确消解到同一实体
+#   ③ Shot 1 T2V 建立人物外观，Shot 2-5 Phantom 保持一致
+# ──────────────────────────────────────────────────────────────────────────────
+
+global_caption: >
+  The video depicts a tense scene in a sandy, desolate environment where a
+  bearded man armed with a sniper rifle is engaged in a standoff. He is seen
+  aiming his weapon, reacting to his surroundings, and pursuing a mysterious
+  masked figure dressed in black with a white face mask.
+
+shots:
+  - shot_id: 1
+    text: >
+      A close-up shot shows a bearded man intently looking through the scope
+      of a large sniper rifle, with a distorted "STOP" sign and sandy
+      background visible.
+    duration_seconds: 3.0
+
+  - shot_id: 2
+    text: >
+      The camera pulls back to show the bearded man standing up, holding his
+      rifle and looking to the side, while two bodies lie on the ground behind
+      him amidst sandbags.
+    duration_seconds: 3.0
+
+  - shot_id: 3
+    text: >
+      The view shifts to over the armed man's shoulder, showing him aiming his
+      rifle towards a person dressed in black with a white face mask walking
+      away towards a building.
+    duration_seconds: 3.0
+
+  - shot_id: 4
+    text: >
+      The armed man runs forward, following the masked figure as they walk away
+      between large stacks of sandbags.
+    duration_seconds: 3.0
+
+  - shot_id: 5
+    text: >
+      Another close-up of the bearded man aiming his rifle through the scope,
+      his expression focused and serious.
+    duration_seconds: 3.0

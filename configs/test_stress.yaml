@@ -1,0 +1,46 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# test_03: 极端一致性压测 · 6镜头
+# 测试目标: 同一角色在极端不同风格（写实→暗调→强逆光→雪天→特写→动作）下的外观保持
+# 难点: Phantom 的 guide_scale_img 是否足够抵抗环境干扰
+# 用途: 调参基准，对比不同 guide_scale_img 值（3.0 / 5.0 / 7.0）的结果
+# ──────────────────────────────────────────────────────────────────────────────
+
+shots:
+  - shot_id: 1
+    text: >
+      Sam Yu, a non-binary person in their mid-20s with a shaved head, a small scar
+      above their left eyebrow, bronze skin, and wearing a red oversized hoodie and
+      black cargo pants, stands in a neutral white studio setting, looking directly
+      at the camera with a calm expression.
+    duration_seconds: 3.0
+
+  - shot_id: 2
+    text: >
+      Sam walks through a dark underground parking lot at night. The only light
+      comes from a distant flickering fluorescent tube. Sam's red hoodie is zipped
+      up. Their footsteps echo on the concrete.
+    duration_seconds: 3.0
+
+  - shot_id: 3
+    text: >
+      Sam stands on a rooftop at golden hour, silhouetted against the blazing orange
+      sky. The strong backlight catches the edges of their red hoodie and shaved head.
+    duration_seconds: 3.0
+
+  - shot_id: 4
+    text: >
+      Sam trudges through heavy snowfall in a park, their red hoodie dusted with snow.
+      They stop to brush snow off a park bench and sit down, breath fogging in the cold air.
+    duration_seconds: 4.0
+
+  - shot_id: 5
+    text: >
+      Extreme close-up of Sam's face — the scar above their left eyebrow is clearly
+      visible. Their eyes are intense, lit by the warm glow of a campfire.
+    duration_seconds: 2.0
+
+  - shot_id: 6
+    text: >
+      Sam sprints across a rain-slicked street, red hoodie soaked and clinging to
+      their body. A car's headlights illuminate them as they leap onto the sidewalk.
+    duration_seconds: 3.0

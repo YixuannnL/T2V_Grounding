@@ -1,0 +1,46 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# test_aba_scene: A→B→A 场景回归测试
+#
+# 核心测试目标：
+#   ① 人物外观一致性：Marcus 在三个镜头中外观保持一致
+#   ② 场景 A 回归一致性：Shot 3 的书房在视觉上与 Shot 1 相似
+#   ③ Grounding 跨镜复用：Shot 1 grounding 结果同时服务 Shot 2（人物）
+#      和 Shot 3（人物 + 场景）
+#
+# 难点：
+#   - Shot 3 不能简单复制 Shot 1，需要体现叙事状态变化（人物情绪/动作）
+#   - 场景 B（仓库）光照完全不同，考验人物外观保持能力
+#   - Shot 3 是 A→B→A 的关键帧，是 pipeline 最终展示效果的落脚点
+#
+# 实体清单（LLM 应解析出）：
+#   char_marcus       高优先级：主角，贯穿全程
+#   loc_study_room    高优先级：场景A，Shot 1 & Shot 3
+#   loc_warehouse     中优先级：场景B，Shot 2
+#   obj_leather_journal 中优先级：道具线索，A→B→A 叙事钩子
+# ──────────────────────────────────────────────────────────────────────────────
+
+shots:
+  - shot_id: 1
+    text: >
+      Marcus Webb, a tall man in his mid-40s with salt-and-pepper hair, a short
+      beard, and a worn brown leather jacket, sits at a large wooden desk in a
+      dimly lit private study. Bookshelves line the warm amber walls. He opens
+      a cracked leather journal under a green banker's lamp, his expression
+      troubled and focused.
+    duration_seconds: 4.0
+
+  - shot_id: 2
+    text: >
+      Marcus walks cautiously through a vast abandoned warehouse at night.
+      Cold blue moonlight streams through broken skylights, casting long shadows
+      across the concrete floor. He grips the leather journal tightly under
+      his arm, scanning the darkness with alert eyes.
+    duration_seconds: 4.0
+
+  - shot_id: 3
+    text: >
+      Marcus returns to his private study. He drops the leather journal onto
+      the wooden desk and slumps into the chair, exhaling heavily. The green
+      banker's lamp still glows on the desk. He stares at the journal with
+      a look of grim resolve, bookshelves behind him unchanged.
+    duration_seconds: 4.0

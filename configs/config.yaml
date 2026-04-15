@@ -1,0 +1,84 @@
+# T2V Grounding — 全局配置
+
+# ── 公司内部 API 配置 ──────────────────────────────────────────────────────────
+api:
+  base_url: "http://yy.dbh.baidu-int.com/v1"
+  api_key: "sk-RnvNGPtDeD0YCqz5wAWXzy9uIXxQWJCh5EsoOdHL14ylfnNy"
+  # 可用 Claude 模型:
+  #   claude-opus-4-6-qmt          (最强，速度慢)
+  #   claude-sonnet-4-6-jh         (推荐，均衡)
+  #   claude-sonnet-4-5-20250929-Anthropic
+
+# ── LLM 配置 ──────────────────────────────────────────────────────────────────
+llm:
+  model: "claude-haiku-4-5"   # 实体解析用 haiku，成本低、限额高；sonnet 留给复杂推理
+  max_tokens: 1024
+
+# ── Visual Grounding 配置 ──────────────────────────────────────────────────────
+grounding:
+  box_threshold: 0.35
+  text_threshold: 0.25
+  gdino_weights: "weights/groundingdino_swinb_cogcoor.pth"
+  gdino_config: "weights/GroundingDINO_SwinB_cfg.py"
+  sam2_config: "sam2_hiera_l.yaml"
+  sam2_weights: "weights/sam2_hiera_large.pt"
+  frame_extract_fps: 2.0
+
+# ── Re-ID 质量评分权重 ────────────────────────────────────────────────────────
+reid:
+  weight_sharpness: 0.4
+  weight_id_confidence: 0.4
+  weight_frontal: 0.2
+  min_quality_threshold: 0.4
+
+# ── 视频生成配置 ──────────────────────────────────────────────────────────────
+generator:
+  backend: "phantom"      # mock | phantom | cogvideo
+                          # phantom = Phantom-Wan，VAE latent 时序拼接 conditioning
+                          #           参考图不锁定姿态，是真正的 ref2video
+                          # cogvideo = CogVideoX-5B-I2V（首帧锁定，备用）
+  width: 832
+  height: 480
+  num_frames: 81          # Wan2.1 要求 4n+1；81帧 = 3.375秒 @24fps
+  fps: 24
+  num_inference_steps: 30   # UniPC solver 30步质量与50步相当，快40%
+  guide_scale_text: 7.5   # 文本对齐强度
+  guide_scale_img: 5.0    # 参考图外观强度（0=忽略参考，10=强制复现参考）
+  seed: -1                 # -1 = 每次随机；设为固定整数可复现结果（如 42）
+  negative_prompt: "blurry, low quality, inconsistent character, deformed"
+
+  # Phantom-Wan 路径（backend=phantom 时生效）
+  # wan2_t2v_dir:   Wan2.1-T2V 的 VAE + T5（Phantom 复用）
+  # phantom_ckpt:   Phantom 自己的 transformer 权重
+  wan2_t2v_dir: "/root/paddlejob/workspace/env_run/output/lyx/Phantom/weights/Wan2.1-T2V-14B"
+  phantom_ckpt:  "/root/paddlejob/workspace/env_run/output/lyx/Phantom/weights/Phantom"
+  phantom_task:  "s2v-14B"   # s2v-1.3B | s2v-14B
+
+  # 多卡配置（torchrun --nproc_per_node=N 启动时生效）
+  # use_usp:  序列并行，配合 xfuser 初始化（已在 ref2video.py 中自动处理）
+  # dit_fsdp: DiT 权重分片，14B 多卡必须开启，否则每卡需独立存完整 FP32 模型(~56GB)
+  # t5_fsdp:  T5 权重分片，同理
+  use_usp:   true    # USP(Ulysses序列并行): 8卡切分sequence，attention计算8x加速
+  dit_fsdp:  true
+  t5_fsdp:   true
+
+  # CogVideoX 路径（backend=cogvideo 时生效，备用）
+  cogvideo_model_id: "THUDM/CogVideoX1.5-5B-I2V"
+
+# ── Pipeline 配置 ─────────────────────────────────────────────────────────────
+pipeline:
+  output_dir: "./output"
+  device: "cuda"
+  max_refs_per_entity: 3     # 每个实体最多使用几张参考图
+  history_window: 3          # 向前看几个镜头做 grounding
+
+# ── Agentic 配置（Phase 2）────────────────────────────────────────────────────
+agent:
+  max_retries: 3
+  consistency_threshold: 0.70
+  model: "claude-sonnet-4-6-Anthropic"
+
+# ── 评测配置 ──────────────────────────────────────────────────────────────────
+evaluation:
+  clip_model: "ViT-B/32"
+  faceid_det_size: [640, 640]

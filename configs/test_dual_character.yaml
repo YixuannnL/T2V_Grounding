@@ -1,0 +1,44 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# test_02: 双角色 · 5镜头
+# 测试目标:
+#   Shot 1 → T2V，建立 Maya 外观入库
+#   Shot 2 → T2V，建立 Leo 外观入库（新角色首次出现）
+#   Shot 3 → Phantom，Maya 有 ref，Leo 无 ref（仅 Maya 用参考图）
+#   Shot 4 → Phantom，Maya + Leo 都有 ref（双角色同时约束）
+#   Shot 5 → Phantom，仅 Maya，测试持续一致性
+# 难点: 两个角色各自的参考图是否互相干扰
+# ──────────────────────────────────────────────────────────────────────────────
+
+shots:
+  - shot_id: 1
+    text: >
+      Maya Reyes, a woman in her late 20s with long curly auburn hair, olive skin,
+      and a bright yellow jacket over a white turtleneck, stands at a subway entrance
+      in the morning rush hour, looking at her phone impatiently.
+    duration_seconds: 3.0
+
+  - shot_id: 2
+    text: >
+      Leo Park, a tall man in his 30s with neat dark brown hair, thin-framed glasses,
+      and a gray wool coat, sits alone at a coffee shop table by the window,
+      reading a newspaper and sipping an espresso.
+    duration_seconds: 3.0
+
+  - shot_id: 3
+    text: >
+      Maya rushes through a crowded train carriage, her curly auburn hair and yellow jacket
+      visible above the sea of commuters. She grips a handrail as the train sways.
+    duration_seconds: 3.0
+
+  - shot_id: 4
+    text: >
+      Maya and Leo meet on a rainy street corner. Maya in her yellow jacket holds
+      an umbrella; Leo in his gray coat pulls his collar up against the rain.
+      They exchange a tense look under the streetlight.
+    duration_seconds: 4.0
+
+  - shot_id: 5
+    text: >
+      Maya walks alone along a quiet riverside path at sunset, her auburn hair
+      blowing in the breeze. She pauses at the railing and gazes at the water.
+    duration_seconds: 3.0

@@ -1,0 +1,14 @@
+{
+  "video": "/root/paddlejob/workspace/env_run/output/lyx/T2V_Grounding/data/test/video.mp4",
+  "frames_extracted": 19,
+  "entities": {
+    "char_main": {
+      "entity_text": "person",
+      "grounding_hits": 5,
+      "best_quality_score": 0.8999999761581421,
+      "best_crop": "/root/paddlejob/workspace/env_run/output/lyx/T2V_Grounding/data/test/phase2_output/crops/char_main/char_main_frame_000077_det01_crop.jpg",
+      "status": "PASS"
+    }
+  },
+  "overall": "PASS"
+}

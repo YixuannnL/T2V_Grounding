@@ -1,0 +1,32 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# test_01: 单角色 · 4镜头 · 场景跨度大
+# 测试目标: Shot 1 T2V 建立 Alex 外观，Shot 2-4 Phantom 保持一致
+# 难点: 从室内→户外→雨夜→特写，光照、背景完全不同
+# ──────────────────────────────────────────────────────────────────────────────
+
+shots:
+  - shot_id: 1
+    text: >
+      Alex Chen, a male detective in his early 30s with short black hair, sharp jawline,
+      and a dark navy trench coat, walks into a brightly lit police station lobby.
+      He carries a worn leather briefcase and looks determined and focused.
+    duration_seconds: 3.0
+
+  - shot_id: 2
+    text: >
+      Alex sits at a cluttered desk inside a small office, surrounded by case files
+      and coffee cups. He studies a photograph closely under a desk lamp.
+      His navy trench coat is hanging on the coat rack behind him.
+    duration_seconds: 3.0
+
+  - shot_id: 3
+    text: >
+      Alex walks quickly across a busy outdoor market in daylight, weaving through
+      the crowd. His navy trench coat flaps in the wind as he scans the stalls.
+    duration_seconds: 3.0
+
+  - shot_id: 4
+    text: >
+      Close-up of Alex's face. He stands under a streetlamp in the rain at night,
+      water dripping from his black hair. His expression is intense and conflicted.
+    duration_seconds: 3.0

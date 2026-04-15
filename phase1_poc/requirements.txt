@@ -1,0 +1,39 @@
+# Phase 1 PoC 依赖
+
+# ── LLM 调用（公司内部 OpenAI 兼容 API）──────────
+openai>=1.30.0
+
+# ── 视觉基础 ─────────────────────────────────────
+torch>=2.1.0
+torchvision>=0.16.0
+Pillow>=10.0.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# ── Grounding DINO ───────────────────────────────
+# pip install groundingdino-py
+# (如果 pip 安装失败，参考: https://github.com/IDEA-Research/GroundingDINO)
+
+# ── SAM2 ─────────────────────────────────────────
+# pip install git+https://github.com/facebookresearch/sam2.git
+
+# ── Re-ID（人脸） ─────────────────────────────────
+insightface>=0.7.3
+onnxruntime-gpu>=1.16.0   # 或 onnxruntime（CPU）
+
+# ── CLIP（评测 + Agent 一致性检测）──────────────
+# pip install git+https://github.com/openai/CLIP.git
+ftfy>=6.1.1
+regex>=2023.0.0
+
+# ── 视频生成（按 backend 选装） ──────────────────
+# backend=wan2 / cogvideo:
+diffusers>=0.31.0
+transformers>=4.46.0
+accelerate>=0.34.0
+# huggingface_hub>=0.24.0
+
+# ── 工具 ─────────────────────────────────────────
+pyyaml>=6.0
+tqdm>=4.66.0
+dataclasses-json>=0.6.0
