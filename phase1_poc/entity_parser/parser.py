@@ -62,9 +62,9 @@ class ParseResult:
 
 SYSTEM_PROMPT = """你是一个专业的影视脚本分析器。
 给定一个镜头的文本描述，以及已知的实体列表（跨镜头上下文），你需要：
-1. 提取该镜头中出现的所有实体（人物、重要物体、场景/地点、整体风格）
+1. 提取该镜头中出现的所有实体（人物、重要物体、场景/地点）
 2. 判断每个实体是否已在历史镜头中出现（共指消解）
-3. 为新实体生成唯一 ID（格式: char_xxx / obj_xxx / loc_xxx / style_xxx）
+3. 为新实体生成唯一 ID（格式: char_xxx / obj_xxx / loc_xxx）
 4. 评估每个实体的 grounding 优先级：
    - high: 人物角色（character）、核心互动物体
    - medium: 场景/地点（location）、重要道具 —— 注意：location 类型必须是 medium，不能是 low
@@ -75,9 +75,11 @@ SYSTEM_PROMPT = """你是一个专业的影视脚本分析器。
    - 如果文本说 "a man and a woman"，character_count 应为 2
    - 如果有多个独立描述的人物，按实际人数统计
 
-**重要**：每个镜头必须包含至少一个 location 类型的实体（type="location"），
-用于描述当前场景环境。location 的 grounding_priority 必须设为 "medium"，
-这对于保持跨镜头的场景一致性至关重要。
+**重要**：
+- 每个镜头必须包含至少一个 location 类型的实体（type="location"），用于描述当前场景环境
+- location 的 grounding_priority 必须设为 "medium"，这对于保持跨镜头的场景一致性至关重要
+- **不要创建 style 类型的实体**！视觉风格（如 "golden hour lighting"、"cinematic style"）
+  应该通过 Global Context 处理，不是独立实体。只输出 character、object、location 三种类型。
 
 如果提供了 global_caption（全局背景描述），请以它为准来理解人物外观和设定。
 当镜头中出现代词或简短指代（如 "the man"、"he"、"the masked figure"）时，

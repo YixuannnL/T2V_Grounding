@@ -235,8 +235,9 @@ class T2VGroundingPipeline:
             is_wide = any(kw in shot_text_lower for kw in ["wide shot", "wide angle", "establishing shot", "full shot"])
 
             # ── 分离 location 和非 location 实体 ──────────────────────────────
+            # 注意：过滤掉 style 类型（风格通过 Global Context 处理，不作为参考图）
             location_entities = [e for e in high_priority if e.type == "location"]
-            non_location_entities = [e for e in high_priority if e.type != "location"]
+            non_location_entities = [e for e in high_priority if e.type not in ("location", "style")]
 
             # ── 处理非 location 实体（character, object）──────────────────────
             # 按 high → medium 优先级排序，每个实体只取 best 1 张
@@ -451,8 +452,9 @@ class T2VGroundingPipeline:
             print(f"[Pipeline] 实际使用的参考图已保存到: {used_refs_shot_dir} ({len(all_ref_paths)} 张)")
 
             # 保存 prompt 到文件，方便 debug
+            # 文件名包含生成模式：shot_001_t2v_prompt.txt 或 shot_001_s2v_prompt.txt
             prompt_path = os.path.join(
-                self.output_dir, "prompts", f"shot_{shot.shot_id:03d}_prompt.txt"
+                self.output_dir, "prompts", f"shot_{shot.shot_id:03d}_{generation_mode}_prompt.txt"
             )
             shot_seed = self.base_seed + shot.shot_id  # 预计算用于记录
             with open(prompt_path, "w", encoding="utf-8") as f:
@@ -780,7 +782,12 @@ class T2VGroundingPipeline:
         all_ground_results = {}  # entity_id -> [GroundingResult, ...]
 
         for entity in parse_result.entities:
+            # 跳过低优先级实体
             if entity.grounding_priority == "low":
+                continue
+            # style 类型不做 grounding（风格是抽象概念，无法在帧中定位）
+            if entity.type == "style":
+                print(f"[Pipeline] 跳过 style 实体 {entity.entity_id}（风格通过 Global Context 处理）")
                 continue
 
             # Grounding DINO 定位
