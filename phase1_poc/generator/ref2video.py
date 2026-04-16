@@ -364,6 +364,14 @@ class Reference2VideoGenerator:
         return output_path
 
     def _mock_generate(self, prompt: str, output_path: str) -> str:
+        # Mock 模式下只有 rank 0 生成视频，其他 rank 等待
+        if self.rank != 0:
+            # 非 rank 0 等待 rank 0 完成
+            if self.world_size > 1:
+                import torch.distributed as dist
+                dist.barrier()
+            return output_path
+
         try:
             import cv2
             import numpy as np
@@ -391,10 +399,19 @@ class Reference2VideoGenerator:
                 os.rename(tmp_path, output_path)
 
             print(f"[Generator] Mock 视频已保存: {output_path}")
+
+            # rank 0 完成后，通知其他 rank
+            if self.world_size > 1:
+                import torch.distributed as dist
+                dist.barrier()
+
             return output_path
         except ImportError:
             with open(output_path, "wb") as f:
                 f.write(b"MOCK_VIDEO")
+            if self.world_size > 1:
+                import torch.distributed as dist
+                dist.barrier()
             return output_path
 
     @staticmethod

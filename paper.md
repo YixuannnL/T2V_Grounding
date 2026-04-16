@@ -126,11 +126,29 @@ To address this, we introduce a \textbf{Generation-Verification Loop} for T2V mo
 
 This verification loop ensures that the ``anchor'' references established in Shot~1 are semantically correct, preventing error accumulation.
 
-\textbf{S2V Mode (subsequent shots with references).} When the registry contains reference crops for at least one high-priority entity in shot $n$, we switch to a subject-to-video model $\mathcal{G}_{\text{S2V}}$:
+\textbf{S2V Mode (subsequent shots with references).} When the registry contains reference crops for at least one high-priority \textbf{subject} entity (character or object) in shot $n$, we switch to a subject-to-video model $\mathcal{G}_{\text{S2V}}$:
 \begin{equation}
 v_n = \mathcal{G}_{\text{S2V}}(s_n,\ \mathcal{I}_n)
 \end{equation}
 where $\mathcal{I}_n$ is the set of reference images retrieved from the registry.
+
+\textbf{Subject-Aware Mode Routing.} A critical observation is that S2V mode requires \emph{subject} references (characters or objects) to anchor the visual appearance. If only \emph{location} references are available, the S2V model lacks appearance constraints for foreground entities, often resulting in style drift (e.g., generating animated characters instead of photorealistic ones).
+
+We introduce a \textbf{subject-aware routing} mechanism:
+\begin{equation}
+\text{mode} = \begin{cases}
+\text{S2V} & \text{if } \exists e \in \mathcal{E}_n^{\text{subj}} : \mathcal{R}[e] \neq \emptyset \\
+\text{T2V} & \text{otherwise}
+\end{cases}
+\end{equation}
+where $\mathcal{E}_n^{\text{subj}} = \{e \in \mathcal{E}_n : e.\text{type} \in \{\text{character}, \text{object}\}\}$ are the subject entities.
+
+When falling back to T2V due to missing subject references, we inject an \textbf{Environment Context} layer into the prompt, describing the location's attributes (lighting, atmosphere, setting) to maintain scene consistency through text guidance rather than image conditioning:
+\begin{equation}
+P_{\text{env}} = \text{BuildEnvContext}(\mathcal{E}_n^{\text{loc}})
+\end{equation}
+
+This ensures that: (1)~S2V is only used when meaningful appearance anchoring is possible; (2)~T2V fallback maintains environmental consistency via enhanced prompts; (3)~style drift from location-only S2V conditioning is avoided.
 
 \textbf{Why S2V and not I2V?} Image-to-video models treat the reference image as the first video frame, strongly constraining both appearance \emph{and} spatial layout/pose. This makes I2V unsuitable for shots with different camera angles or actions. S2V models like Phantom instead encode reference images as appearance tokens in a parallel conditioning stream, exerting appearance-level influence without fixing spatial structure.
 
@@ -227,6 +245,12 @@ P_{\text{light}} = \text{BuildLightingContext}(\text{desc}, \text{tone})
 \end{equation}
 This layer is only included when: (1)~the shot is a close-up, (2)~location references are excluded, and (3)~lighting analysis is available.
 
+\textbf{Layer 2.5: Environment Context (T2V Fallback).} When subject-aware routing falls back to T2V mode due to missing subject references, we inject environment descriptions derived from location entities:
+\begin{equation}
+P_{\text{env}} = \bigcup_{e \in \mathcal{E}_n^{\text{loc}}} \text{Format}(\text{``Scene''}, e.\text{desc}, e.\text{attr})
+\end{equation}
+This ensures scene consistency is maintained through text guidance when image conditioning is unavailable.
+
 \textbf{Layer 3: Shot Entity Context.} Detailed descriptions of entities that \emph{actually appear in the current shot}, retrieved from the entity graph:
 \begin{equation}
 P_{\text{entity}} = \bigcup_{e \in \mathcal{E}_n} \text{Format}(e.\text{type}, e.\text{desc}, e.\text{attr})
@@ -236,11 +260,11 @@ P_{\text{entity}} = \bigcup_{e \in \mathcal{E}_n} \text{Format}(e.\text{type}, e
 
 The final prompt is constructed as:
 \begin{equation}
-P_n = P_{\text{global}} \oplus [P_{\text{light}}] \oplus P_{\text{entity}} \oplus s_n
+P_n = P_{\text{global}} \oplus [P_{\text{light}}] \oplus [P_{\text{env}}] \oplus P_{\text{entity}} \oplus s_n
 \end{equation}
-where $[\cdot]$ denotes conditional inclusion based on the agentic lighting decision.
+where $[\cdot]$ denotes conditional inclusion based on the agentic lighting decision (for $P_{\text{light}}$) or T2V fallback mode (for $P_{\text{env}}$).
 
-This four-layer design ensures that: (1)~stylistic coherence is maintained across shots via the global context, (2)~lighting consistency is preserved even when location references are excluded, (3)~only relevant entities are described to the generation model, and (4)~the original creative intent of each shot is preserved.
+This four-layer design ensures that: (1)~stylistic coherence is maintained across shots via the global context, (2)~lighting consistency is preserved even when location references are excluded, (3)~environment consistency is maintained when falling back to T2V, (4)~only relevant entities are described to the generation model, and (5)~the original creative intent of each shot is preserved.
 
 % ----------------------------------------------------------------------------
 \subsection{Post-Generation Visual Grounding}
@@ -355,9 +379,12 @@ Algorithm~\ref{alg:pipeline} presents the full agentic pipeline. The loop proces
         \STATE $\mathcal{I}_{\text{loc}} \leftarrow \mathcal{R}.\text{query}(\mathcal{E}_n^{\text{loc}}, k\!=\!1)$
     \ENDIF
     \STATE $\mathcal{I}_n \leftarrow \text{Filter}(\mathcal{I}_{\text{ch}} \cup \mathcal{I}_{\text{obj}} \cup \mathcal{I}_{\text{loc}})$
-    \IF{$\mathcal{I}_n \neq \emptyset$}
+    \STATE \COMMENT{Subject-aware mode routing}
+    \STATE $\text{has\_subj} \leftarrow (\mathcal{I}_{\text{ch}} \cup \mathcal{I}_{\text{obj}}) \neq \emptyset$
+    \IF{$\text{has\_subj}$}
         \STATE $v_n \leftarrow \mathcal{G}_{\text{S2V}}(P_n, \mathcal{I}_n, \text{seed}_n)$
     \ELSE
+        \STATE $P_n \leftarrow \text{InjectEnv}(P_n, \mathcal{E}_n^{\text{loc}})$ \COMMENT{T2V fallback}
         \STATE $v_n \leftarrow \mathcal{G}_{\text{T2V}}(P_n, \text{seed}_n)$
     \ENDIF
     \STATE $\mathcal{F}_n \leftarrow \text{ExtractFrames}(v_n, \text{fps}=1)$

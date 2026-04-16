@@ -99,11 +99,12 @@ Pipeline 在正式处理镜头前，会：
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Prompt 分层结构（四层）**：
+**Prompt 分层结构（四层 + 条件层）**：
 | 层级 | 名称 | 来源 | 作用 |
 |------|------|------|------|
 | Layer 1 | Global Context | `global_caption` 提取 | 风格、氛围、叙事背景 |
 | Layer 2 | Lighting Context | LLM 光线分析 | 仅 close-up + 不传 location 时注入 |
+| **Layer 2.5** | **Environment Context** | location 实体属性 | **仅 T2V 回退时注入，保持环境一致性** |
 | Layer 3 | Shot Entities | 本 shot 实体描述 | 角色、物体、场景 |
 | Layer 4 | Shot Text | 原始镜头描述 | 动作、构图 |
 
@@ -153,14 +154,31 @@ Pipeline 在正式处理镜头前，会：
                               │
                               ▼
         ┌─────────────────────────────────────────┐
-        │ reference_used 列表有图？                │
+        │ 【Subject-Aware 路由】                   │
+        │ 有 subject（character/object）参考图？   │
         │                                         │
         │   YES ──▶ generation_mode = "phantom"   │
         │           使用 Phantom S2V（参考图+文本）│
         │                                         │
         │   NO  ──▶ generation_mode = "t2v"       │
         │           使用 WanT2V（纯文本生成）      │
+        │           + 注入 Environment Context    │
+        │           保持环境一致性                │
         └─────────────────────────────────────────┘
+```
+
+**Subject-Aware 路由（防止风格漂移）**：
+
+这是 v2.0 新增的关键设计。观察发现：当只有 location 参考图而没有 subject（character/object）参考图时，S2V 模型缺少人物外观锚定，会导致生成的人物风格漂移（例如真人变成动画风格）。
+
+**解决方案**：基于是否有 subject 参考图来决定生成模式：
+- 有 character/object ref → S2V，外观有锚定
+- 仅有 location ref → T2V + Environment Context prompt，避免风格漂移
+
+**Environment Context 注入**：当回退 T2V 时，从 location 实体中提取环境属性注入 prompt：
+```
+[Environment Context]
+Scene: Interrogation room (lighting: fluorescent, harsh shadows, atmosphere: tense).
 ```
 
 **锚点策略（防止误差累积）**：
@@ -219,7 +237,8 @@ anchor = registry.query_anchor(
 
 **路由逻辑要点**：
 - Shot 1 必定走 `t2v`（首镜头，Registry 为空）
-- Shot 2+ 若历史有参考图则走 `phantom`
+- Shot 2+ 若有 **subject（character/object）参考图** 则走 `phantom`
+- **【v2.0】** 若只有 location ref 而无 subject ref → 回退 `t2v` + Environment Context
 - 新角色首次出现也走 `t2v`，生成后入库，下一镜头就有参考了
 - **每个 shot 使用递增的 seed**（`base_seed + shot_id`），增加生成多样性
 
@@ -333,6 +352,35 @@ def build_closeup_lighting_prompt(analysis: CloseupLightingAnalysis) -> str:
     """
 ```
 
+#### Layer 2.5: Environment Context（T2V 回退时的环境描述）
+
+**【v2.0 新增】** 当因无 subject 参考图而回退 T2V 模式时，从 location 实体中提取环境属性注入 prompt，通过文本引导保持场景一致性：
+
+```python
+# 在 pipeline.py 中
+if generation_mode == "t2v" and location_entities:
+    env_desc_parts = []
+    for loc_entity in location_entities:
+        source = self.parser._get_entity(loc_entity.entity_id) or loc_entity
+        desc = source.text_description
+        if source.attributes:
+            attrs = ", ".join(f"{k}: {v}" for k, v in source.attributes.items())
+            desc = f"{desc} ({attrs})"
+        env_desc_parts.append(f"Scene: {desc}.")
+    env_context = "[Environment Context]\n" + "\n".join(env_desc_parts)
+    prompt_parts.append(env_context)
+```
+
+**输出示例**：
+```
+[Environment Context]
+Scene: Interrogation room (lighting: fluorescent, harsh shadows, atmosphere: tense, formal).
+```
+
+**触发条件**：
+- `generation_mode == "t2v"`（无 subject 参考图）
+- 当前 shot 有 location 实体
+
 #### Layer 3: Shot Context（当前镜头实体描述）
 
 由 `build_shot_context()` 构建，**只包含本 shot 实际出现的实体**，从实体图谱中查找完整属性：
@@ -362,9 +410,28 @@ prompt_parts = []
 prompt_parts.append(global_context)      # Layer 1: 全局语义
 if is_closeup and not include_location and closeup_lighting_analysis:
     prompt_parts.append(lighting_prompt) # Layer 2: 光线引导（仅特定条件）
+if generation_mode == "t2v" and location_entities:
+    prompt_parts.append(env_context)     # Layer 2.5: 环境描述（T2V 回退时）
 prompt_parts.append(shot_context)        # Layer 3: 实体描述
 prompt_parts.append(shot.text)           # Layer 4: 动作描述
 gen_prompt = "\n\n".join(prompt_parts)
+```
+
+**实际输出示例（T2V 回退，有 location）**：
+```
+[Global Context]
+Visual style: cinematic, noir lighting.
+Mood: tense, suspenseful.
+Setting: police station interior.
+
+[Environment Context]
+Scene: Interrogation room (lighting: fluorescent, harsh shadows, atmosphere: tense).
+
+[Shot Entities]
+Character: Alex Chen (gender: male, age: 30s, clothing: dark trench coat).
+Character: A nervous suspect (demeanor: nervous, position: seated).
+
+Inside the interrogation room, Alex sits across from a nervous suspect.
 ```
 
 **实际输出示例（Close-up 镜头，不传 location）**：

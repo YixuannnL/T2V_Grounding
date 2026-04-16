@@ -349,11 +349,33 @@ class T2VGroundingPipeline:
                     else:
                         print(f"[Pipeline] Location '{loc_entity.entity_id}' 无参考图 (新场景，将在生成后 grounding)")
 
-            generation_mode = "phantom" if all_ref_paths and not self.mock_mode else \
-                              ("t2v" if not self.mock_mode else "mock")
+            # ── 关键改动：基于是否有 subject ref 决定生成模式 ──────────────────
+            # 问题：如果只有 location ref（无 character/object ref），S2V 会失去
+            #       人物外观锚定，可能生成动画风格视频
+            # 解决：只有当有 subject（character/object）ref 时才用 S2V，
+            #       否则回退 T2V + prompt 强化环境描述
+            has_subject_ref = any(
+                e.entity_id in reference_used
+                for e in non_location_entities
+            )
+            num_subject_refs = len([e for e in non_location_entities if e.entity_id in reference_used])
+            num_location_refs = len([e for e in location_entities if e.entity_id in reference_used])
+
+            if self.mock_mode:
+                generation_mode = "mock"
+            elif has_subject_ref:
+                # 有 subject ref → S2V，外观有锚定
+                generation_mode = "phantom"
+            else:
+                # 无 subject ref（可能只有 location ref）→ T2V + prompt 强化
+                generation_mode = "t2v"
+                if num_location_refs > 0:
+                    print(f"[Pipeline] ⚠️  无 subject 参考图，仅有 location ref，回退 T2V 避免风格漂移")
+                    # 清空 all_ref_paths，T2V 不传参考图
+                    all_ref_paths = []
+
             print(f"[Pipeline] 模式: {generation_mode} | 参考图: {len(all_ref_paths)} 张 "
-                  f"(非location: {len(all_ref_paths) - len([e for e in location_entities if e.entity_id in reference_used])}, "
-                  f"location: {len([e for e in location_entities if e.entity_id in reference_used])})")
+                  f"(subject: {num_subject_refs}, location: {num_location_refs})")
 
             # ── 构建生成 prompt ────────────────────────────────────────────────
             # Prompt 分层：
@@ -379,6 +401,25 @@ class T2VGroundingPipeline:
                 if lighting_prompt:
                     prompt_parts.append(lighting_prompt)
                     print(f"[Pipeline] Lighting context:\n{lighting_prompt}")
+
+            # Layer 2.5: T2V 回退时的环境描述强化
+            # 当无 subject ref 回退 T2V 时，通过 prompt 描述 location 环境以保持一致性
+            if generation_mode == "t2v" and location_entities:
+                env_desc_parts = []
+                for loc_entity in location_entities:
+                    # 从 parser 的已知实体库中获取完整属性
+                    known = self.parser._get_entity(loc_entity.entity_id)
+                    source = known if known else loc_entity
+                    desc = source.text_description.strip()
+                    if source.attributes:
+                        attr_items = [f"{k}: {v}" for k, v in source.attributes.items() if v]
+                        if attr_items:
+                            desc = f"{desc} ({', '.join(attr_items)})"
+                    env_desc_parts.append(desc)
+                if env_desc_parts:
+                    env_context = "[Environment Context]\n" + "\n".join(f"Scene: {d}." for d in env_desc_parts)
+                    prompt_parts.append(env_context)
+                    print(f"[Pipeline] Environment context (T2V fallback):\n{env_context}")
 
             # Layer 3: 当前 shot 的实体描述
             shot_context = self.parser.build_shot_context(parse_result)

@@ -280,7 +280,7 @@ class EntityParser:
         raw_json = self.llm.chat(
             user_message=user_message,
             system=SYSTEM_PROMPT,
-            max_tokens=1024,  # 实体 JSON 响应通常 <500 tokens，4096 是浪费
+            max_tokens=2048,  # 增加到 2048，防止复杂场景截断
         ).strip()
         # 兼容 LLM 偶尔输出 ```json ``` 包裹
         if raw_json.startswith("```"):
@@ -303,7 +303,14 @@ class EntityParser:
         if end_idx > 0:
             raw_json = raw_json[:end_idx]
 
-        data = json.loads(raw_json)
+        # 尝试解析 JSON，如果失败则进行修复
+        try:
+            data = json.loads(raw_json)
+        except json.JSONDecodeError as e:
+            print(f"[Parser] JSON 解析失败: {e}")
+            print(f"[Parser] 原始响应 (前500字符): {raw_json[:500]}...")
+            # 尝试修复常见的截断问题
+            data = self._repair_truncated_json(raw_json, shot_id)
         entities = [Entity(**e) for e in data["entities"]]
 
         # 解析 entity_counts（用于 Shot 1 验证）
@@ -357,6 +364,99 @@ class EntityParser:
             style_ref_shot=data.get("style_ref_shot"),
             entity_counts=entity_counts,
         )
+
+    def _repair_truncated_json(self, raw_json: str, shot_id: int) -> dict:
+        """
+        尝试修复被截断的 JSON 响应。
+
+        策略：
+        1. 如果能提取出 entities 数组，即使其他字段缺失也返回
+        2. 如果完全无法修复，重新调用 LLM 并要求更简洁的响应
+        """
+        import re
+
+        # 策略 1: 尝试提取 entities 数组
+        entities_match = re.search(r'"entities"\s*:\s*\[', raw_json)
+        if entities_match:
+            # 找到 entities 数组的开始，尝试找到完整的数组
+            start = entities_match.end() - 1  # '[' 的位置
+            bracket_count = 0
+            end_idx = -1
+            in_string = False
+            escape_next = False
+
+            for i in range(start, len(raw_json)):
+                ch = raw_json[i]
+                if escape_next:
+                    escape_next = False
+                    continue
+                if ch == '\\':
+                    escape_next = True
+                    continue
+                if ch == '"' and not escape_next:
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if ch == '[':
+                    bracket_count += 1
+                elif ch == ']':
+                    bracket_count -= 1
+                    if bracket_count == 0:
+                        end_idx = i + 1
+                        break
+
+            if end_idx > 0:
+                entities_str = raw_json[start:end_idx]
+                try:
+                    entities = json.loads(entities_str)
+                    print(f"[Parser] 修复成功：从截断响应中提取了 {len(entities)} 个实体")
+                    return {
+                        "entities": entities,
+                        "new_elements": [],
+                        "style_ref_shot": None,
+                        "entity_counts": {}
+                    }
+                except json.JSONDecodeError:
+                    pass
+
+        # 策略 2: 重新调用 LLM，要求更简洁的响应
+        print(f"[Parser] JSON 修复失败，重新调用 LLM...")
+        known_ctx = self._build_known_context()
+        global_section = ""
+        if self._global_caption and shot_id > 0:
+            global_section = f"\n全局背景（简要参考）:\n{self._global_caption[:500]}...\n"
+
+        retry_message = f"""当前镜头 ID: {shot_id}
+请只输出一个 **简短** 的 JSON，仅包含最重要的实体（最多3个），格式如下：
+{{"entities": [...], "new_elements": [], "entity_counts": {{"character_count": N}}}}
+
+已知实体:
+{known_ctx}
+{global_section}"""
+
+        retry_response = self.llm.chat(
+            user_message=retry_message,
+            system="你是实体解析器。只输出JSON，不要任何其他文字。实体数量不超过3个。",
+            max_tokens=1024,
+        ).strip()
+
+        # 清理响应
+        if retry_response.startswith("```"):
+            retry_response = retry_response.split("```")[1]
+            if retry_response.startswith("json"):
+                retry_response = retry_response[4:]
+            retry_response = retry_response.strip()
+
+        try:
+            return json.loads(retry_response)
+        except json.JSONDecodeError as e:
+            print(f"[Parser] 重试也失败: {e}，返回空结果")
+            return {
+                "entities": [],
+                "new_elements": [],
+                "entity_counts": {}
+            }
 
     def _build_known_context(self) -> str:
         if not self._known_entities:
