@@ -334,18 +334,20 @@ class T2VGroundingPipeline:
 
             # ── 处理 location 实体（场景一致性 / 光线一致性）────────────────────
             # 根据上面的 Agentic 决策结果决定是否传 location
+            # 使用 query_anchor_location：优先最早 shot，除非后续有明显更好的
             if include_location:
                 for loc_entity in location_entities:
-                    refs = self.registry.query(
-                        loc_entity.entity_id, top_k=1,
+                    anchor = self.registry.query_anchor_location(
+                        loc_entity.entity_id,
                         min_quality=0.3,
-                        anchor_strategy="earliest_good"  # location 也用最早的
+                        high_quality_threshold=0.7,  # 质量 >= 0.7 的直接用
+                        quality_gap_ratio=1.5,       # 后续需要好 1.5 倍以上才切换
                     )
-                    if refs:
-                        reference_used[loc_entity.entity_id] = [refs[0].crop_path]
-                        all_ref_paths.append(refs[0].crop_path)
+                    if anchor:
+                        reference_used[loc_entity.entity_id] = [anchor.crop_path]
+                        all_ref_paths.append(anchor.crop_path)
                         print(f"[Pipeline] Location '{loc_entity.entity_id}' 使用锚点参考图 "
-                              f"(shot={refs[0].shot_id})")
+                              f"(shot={anchor.shot_id}, score={anchor.quality_score:.2f})")
                     else:
                         print(f"[Pipeline] Location '{loc_entity.entity_id}' 无参考图 (新场景，将在生成后 grounding)")
 

@@ -147,7 +147,10 @@ Pipeline 在正式处理镜头前，会：
 │     → 若最早 shot 质量 < 0.85，会去找后续 shot 的高质量正脸 │
 │                                                            │
 │ Step 4: 处理 location 实体（场景一致性）                    │
-│   Registry.query(loc_entity_id, anchor_strategy="earliest")│
+│   Registry.query_anchor_location(loc_entity_id,            │
+│       min_quality=0.3, high_quality_threshold=0.7,         │
+│       quality_gap_ratio=1.5)                               │
+│   【锚点策略】优先最早 shot，除非后续背景明显更好（>1.5倍）│
 │     有参考图 → 必须使用（保证场景一致性）                   │
 │     无参考图 → 新场景，跳过                                 │
 └────────────────────────────────────────────────────────────┘
@@ -235,10 +238,53 @@ anchor = registry.query_anchor(
 # 日志：选择后续高质量正脸 (shot=2, score=0.93) 优于最早shot (shot=1, score=0.72)
 ```
 
+**Location 锚点策略（v2.1 新增）**：
+
+Location 实体也有类似问题：Shot 1 可能是 close-up 镜头，导致背景因景深效果而模糊，但后续 wide shot 可能有更清晰的背景。
+
+**策略 "earliest_unless_much_worse"**：
+```
+┌─────────────────────────────────────────────────────────────────┐
+│          Location Anchor Strategy (v2.1)                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  核心原则：默认锚定最早 shot，除非后续背景明显更好               │
+│                                                                 │
+│  规则：                                                          │
+│  1. 如果最早 shot 背景质量 >= 0.7 → 选它（已够好）              │
+│  2. 如果后续有背景质量 > 最早 × 1.5 → 选后续更好的              │
+│  3. 否则 → 选最早 shot（防止场景漂移）                          │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**示例**：
+```
+loc_opulent_room 的背景参考图：
+  - Shot 1: 0.34 (close-up 导致模糊，清晰度极低)
+  - Shot 2: 0.35
+  - Shot 3: 0.95 (wide shot，背景清晰)
+
+旧策略 (earliest_good): 选 Shot 1 的 0.34 (模糊) ❌
+新策略 (earliest_unless_much_worse): 选 Shot 3 的 0.95 ✅
+  → 因为 0.95 / 0.34 = 2.8x > 1.5x 阈值
+```
+
+```python
+# Location 专用锚点查询
+anchor = registry.query_anchor_location(
+    entity_id,
+    min_quality=0.3,
+    high_quality_threshold=0.7,   # 质量 >= 0.7 直接用
+    quality_gap_ratio=1.5,        # 后续需要好 1.5 倍以上才切换
+)
+```
+
 **路由逻辑要点**：
 - Shot 1 必定走 `t2v`（首镜头，Registry 为空）
 - Shot 2+ 若有 **subject（character/object）参考图** 则走 `phantom`
 - **【v2.0】** 若只有 location ref 而无 subject ref → 回退 `t2v` + Environment Context
+- **【v2.1】** Location 使用专用锚点策略，优先早期但允许切换到明显更好的背景
 - 新角色首次出现也走 `t2v`，生成后入库，下一镜头就有参考了
 - **每个 shot 使用递增的 seed**（`base_seed + shot_id`），增加生成多样性
 
@@ -577,8 +623,9 @@ if entity_type == "location":
 
 **文件**：`visual_grounding/reid.py`
 
-对所有裁切图打分，过滤低质量截图：
+对所有裁切图打分，过滤低质量截图。**Character 和 Location 使用不同的评分公式**：
 
+**Character 评分**：
 ```python
 @dataclass
 class QualityScore:
@@ -587,11 +634,26 @@ class QualityScore:
     frontal_score: float   # 正面程度（yaw 角接近 0 则高）
     final_score: float     # 加权综合分
 
-# 综合分计算
+# Character 综合分计算
 final = 0.4 * sharpness + 0.4 * id_confidence + 0.2 * frontal_score
 ```
 
-**评分维度详解**：
+**Location 专用评分（v2.1 新增）**：
+
+Close-up 镜头可能导致背景模糊（景深效果），传统评分无法区分。Location 使用专用评分：
+
+```python
+# Location 综合分计算
+final = 0.5 * sharpness + 0.3 * content_richness + 0.2 * (1 - inpaint_penalty)
+```
+
+| 维度 | 计算方式 | 作用 |
+|-----|---------|------|
+| 清晰度 | `cv2.Laplacian(gray).var() / 500` | 过滤模糊背景（权重最高 50%）|
+| 内容丰富度 | Canny 边缘密度 + 颜色方差 | 确保场景细节丰富 |
+| inpaint 惩罚 | 白色/过曝区域占比 | 惩罚前景抠除残留 |
+
+**评分维度详解（Character）**：
 
 | 维度 | 计算方式 | 作用 |
 |-----|---------|------|
@@ -751,9 +813,9 @@ registry.register(entity_id, ReferenceEntry(
 | 组件 | 文件 | 职责 |
 |------|------|------|
 | LLM 实体解析器 | `entity_parser/parser.py` | 调用 Claude 从文本提取实体，跨镜头共指消解，全局语义提取，**实体数量提取**，**Close-up 光线分析** |
-| 参考图库 | `reference_manager/registry.py` | SQLite 数据库，存储每个实体的参考截图路径和质量分 |
+| 参考图库 | `reference_manager/registry.py` | SQLite 数据库，存储每个实体的参考截图路径和质量分，**支持 Location 专用锚点查询** |
 | 视觉 Grounding | `visual_grounding/grounder.py` | Grounding DINO 检测 + SAM2 分割，从生成视频中定位并裁切实体 |
-| 质量评分 | `visual_grounding/reid.py` | 对裁切图打分（清晰度、人脸置信度、正面程度、bbox 面积），过滤低质量截图 |
+| 质量评分 | `visual_grounding/reid.py` | 对裁切图打分（清晰度、人脸置信度、正面程度、bbox 面积），**Location 专用评分（清晰度+内容丰富度+inpaint惩罚）** |
 | **Shot 1 验证器** | `verification/entity_count_verifier.py` | **【新增】** T2V 生成后验证人数是否匹配预期，支持自动重试 |
 | 视频生成器 | `generator/ref2video.py` | 封装 WanT2V 和 Phantom S2V，含参考图预处理、T2V/S2V 动态切换、VRAM 管理、多卡支持 |
 | 主 Pipeline | `orchestrator/pipeline.py` | 串联以上所有组件，**四层 Prompt 构建**，prompt 保存，多卡分布式逻辑，**验证循环**，**Agentic 光线决策** |

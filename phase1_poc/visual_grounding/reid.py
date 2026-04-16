@@ -1,9 +1,12 @@
 """
 visual_grounding/reid.py
 职责: 对 Grounding 结果进行质量评分，筛选最佳参考帧
-人物: InsightFace FaceID 置信度 + 清晰度 + 正面角度
-通用: CLIP 特征相似度 + 遮挡检测
-综合分 = 0.4×清晰度 + 0.4×ID置信度 + 0.2×正面角度
+
+Character: InsightFace FaceID 置信度 + 清晰度 + 正面角度
+  综合分 = 0.4×清晰度 + 0.4×ID置信度 + 0.2×正面角度
+
+Location:  清晰度 + 内容丰富度 + inpaint残留惩罚
+  综合分 = 0.5×清晰度 + 0.3×内容丰富度 + 0.2×(1-inpaint惩罚)
 """
 
 import os
@@ -22,6 +25,10 @@ class QualityScore:
     frontal_score: float      # 0-1，正面程度（yaw 角接近 0 则高）
     occlusion_score: float    # 0-1，无遮挡程度
     final_score: float        # 加权综合分
+    # Location 专用字段
+    content_richness: float = 0.0   # 0-1，内容丰富度（边缘密度）
+    inpaint_penalty: float = 0.0    # 0-1，inpaint 白色区域占比（越低越好）
+    sharpness_raw: float = 0.0      # 原始 Laplacian 方差值（未归一化）
 
 
 class ReferenceQualityScorer:
@@ -57,11 +64,55 @@ class ReferenceQualityScorer:
 
     # ── 清晰度评分（Laplacian 方差）─────────────────────────────────────────
     @staticmethod
-    def _compute_sharpness(img_bgr: np.ndarray) -> float:
+    def _compute_sharpness(img_bgr: np.ndarray, return_raw: bool = False) -> float:
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
         lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
         # 归一化：经验上 500 以上算清晰，映射到 0-1
-        return min(1.0, lap_var / 500.0)
+        normalized = min(1.0, lap_var / 500.0)
+        if return_raw:
+            return normalized, lap_var
+        return normalized
+
+    # ── Location 专用：内容丰富度（边缘密度）─────────────────────────────────
+    @staticmethod
+    def _compute_content_richness(img_bgr: np.ndarray) -> float:
+        """
+        计算图像的内容丰富度：边缘密度 + 颜色方差
+        用于评估背景是否有足够的场景细节
+        """
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+        # 1. 边缘密度（Canny 边缘占比）
+        edges = cv2.Canny(gray, 50, 150)
+        edge_density = np.sum(edges > 0) / edges.size
+        # 归一化：0.05 以上算丰富
+        edge_score = min(1.0, edge_density / 0.05)
+
+        # 2. 颜色方差（HSV 空间的 Hue 和 Saturation 方差）
+        hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+        sat_var = np.var(hsv[:, :, 1]) / 255.0  # 饱和度方差
+        # 归一化
+        color_score = min(1.0, sat_var / 0.1)
+
+        # 综合
+        return 0.7 * edge_score + 0.3 * color_score
+
+    # ── Location 专用：检测 inpaint 白色区域 ─────────────────────────────────
+    @staticmethod
+    def _compute_inpaint_penalty(img_bgr: np.ndarray) -> float:
+        """
+        检测 inpaint 残留的白色/过曝区域占比
+        返回 0-1，值越大表示白色区域越多（越不好）
+        """
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+
+        # 白色区域：高亮度 + 低饱和度
+        white_mask = (gray > 240) & (hsv[:, :, 1] < 30)
+        white_ratio = np.sum(white_mask) / white_mask.size
+
+        # 归一化：超过 20% 白色区域就给最大惩罚
+        return min(1.0, white_ratio / 0.2)
 
     # ── 人脸正面度 & ID 置信度 ────────────────────────────────────────────
     def _compute_face_scores(self, img_bgr: np.ndarray):
@@ -129,6 +180,46 @@ class ReferenceQualityScorer:
             final_score=round(final, 3),
         )
 
+    def score_location(
+        self,
+        crop_path: str,
+        bbox_area: Optional[float] = None,
+    ) -> QualityScore:
+        """
+        Location 专用评分：清晰度 + 内容丰富度 + inpaint 惩罚
+
+        评分公式：
+            final = 0.5×清晰度 + 0.3×内容丰富度 + 0.2×(1-inpaint惩罚)
+
+        清晰度权重最高，因为模糊背景会严重影响生成质量。
+        """
+        img_bgr = cv2.imread(crop_path)
+        if img_bgr is None:
+            return QualityScore(crop_path, 0, 0, 0, 0, 0)
+
+        sharpness, sharpness_raw = self._compute_sharpness(img_bgr, return_raw=True)
+        content_richness = self._compute_content_richness(img_bgr)
+        inpaint_penalty = self._compute_inpaint_penalty(img_bgr)
+
+        # Location 评分公式
+        final = (
+            0.5 * sharpness +
+            0.3 * content_richness +
+            0.2 * (1 - inpaint_penalty)
+        )
+
+        return QualityScore(
+            crop_path=crop_path,
+            sharpness=round(sharpness, 3),
+            id_confidence=1.0,  # location 不需要
+            frontal_score=1.0,  # location 不需要
+            occlusion_score=1.0,
+            final_score=round(final, 3),
+            content_richness=round(content_richness, 3),
+            inpaint_penalty=round(inpaint_penalty, 3),
+            sharpness_raw=round(sharpness_raw, 1),
+        )
+
     def rank_references(
         self,
         crop_paths: List[str],
@@ -144,10 +235,18 @@ class ReferenceQualityScorer:
                 x1, y1, x2, y2 = r.bbox
                 bbox_areas[r.crop_path] = (x2 - x1) * (y2 - y1)
 
-        scores = [
-            self.score(p, entity_type, bbox_area=bbox_areas.get(p))
-            for p in crop_paths
-        ]
+        # 根据实体类型选择评分方法
+        if entity_type == "location":
+            scores = [
+                self.score_location(p, bbox_area=bbox_areas.get(p))
+                for p in crop_paths
+            ]
+        else:
+            scores = [
+                self.score(p, entity_type, bbox_area=bbox_areas.get(p))
+                for p in crop_paths
+            ]
+
         scores.sort(key=lambda s: s.final_score, reverse=True)
         return scores
 

@@ -208,6 +208,96 @@ class EntityRegistry:
               f"(shot={earliest_shot}, score={earliest_score:.2f})")
         return ReferenceEntry(*earliest_best)
 
+    def query_anchor_location(
+        self,
+        entity_id: str,
+        min_quality: float = 0.3,
+        high_quality_threshold: float = 0.7,
+        quality_gap_ratio: float = 3.0,
+    ) -> Optional[ReferenceEntry]:
+        """
+        获取 Location 实体的"锚点"参考图
+
+        策略 "earliest_unless_much_worse"：
+        ─────────────────────────────────────────────────────────
+        核心原则：
+          - 默认锚定最早 shot 的背景（保持场景一致性）
+          - 除非后续 shot 有 **明显** 更好的背景（质量差距超过阈值）
+
+        判断逻辑：
+          1. 找最早 shot 中质量最高的背景 (earliest_best)
+          2. 找全部 shot 中质量最高的背景 (global_best)
+          3. 如果 earliest_best 质量已经 >= high_quality_threshold → 选它
+          4. 如果 global_best / earliest_best > quality_gap_ratio → 选 global_best
+          5. 否则 → 选 earliest_best（默认锚定早期）
+
+        Args:
+            entity_id:              实体 ID
+            min_quality:            基础质量阈值
+            high_quality_threshold: 高质量阈值（超过此分数不再考虑切换）
+            quality_gap_ratio:      质量差距倍数阈值（后续背景需要好这么多倍才切换）
+
+        Returns:
+            最佳锚点参考图，或 None
+        """
+        conn = sqlite3.connect(self.db_path)
+
+        # Step 1: 找最早 shot 中质量最高的背景
+        earliest_best = conn.execute("""
+            SELECT entity_id, shot_id, frame_path, crop_path, quality_score, source, created_at
+            FROM ref_entries
+            WHERE entity_id = ? AND quality_score >= ?
+            ORDER BY shot_id ASC, quality_score DESC
+            LIMIT 1
+        """, (entity_id, min_quality)).fetchone()
+
+        if earliest_best is None:
+            conn.close()
+            return None
+
+        earliest_score = earliest_best[4]  # quality_score
+        earliest_shot = earliest_best[1]   # shot_id
+
+        # Step 2: 如果最早 shot 已经是高质量，直接返回
+        if earliest_score >= high_quality_threshold:
+            conn.close()
+            print(f"[Registry] Location 锚点: {entity_id} | 最早shot已高质量 "
+                  f"(shot={earliest_shot}, score={earliest_score:.2f})")
+            return ReferenceEntry(*earliest_best)
+
+        # Step 3: 找全部 shot 中质量最高的背景
+        global_best = conn.execute("""
+            SELECT entity_id, shot_id, frame_path, crop_path, quality_score, source, created_at
+            FROM ref_entries
+            WHERE entity_id = ? AND quality_score >= ?
+            ORDER BY quality_score DESC, shot_id ASC
+            LIMIT 1
+        """, (entity_id, min_quality)).fetchone()
+
+        conn.close()
+
+        if global_best is None:
+            return ReferenceEntry(*earliest_best)
+
+        global_score = global_best[4]
+        global_shot = global_best[1]
+
+        # Step 4: 判断质量差距是否超过阈值
+        # 避免除零，且如果 earliest_score 很低，gap 会很大
+        if earliest_score > 0 and global_score / earliest_score >= quality_gap_ratio:
+            print(f"[Registry] Location 锚点: {entity_id} | 选择后续高质量背景 "
+                  f"(shot={global_shot}, score={global_score:.2f}) "
+                  f"因为比最早shot (shot={earliest_shot}, score={earliest_score:.2f}) "
+                  f"好 {global_score/earliest_score:.1f}x (阈值={quality_gap_ratio}x)")
+            return ReferenceEntry(*global_best)
+
+        # Step 5: 质量差距不够大，回退选最早 shot
+        print(f"[Registry] Location 锚点: {entity_id} | 锚定最早shot "
+              f"(shot={earliest_shot}, score={earliest_score:.2f}) "
+              f"虽然有更好的 (shot={global_shot}, score={global_score:.2f}) "
+              f"但差距只有 {global_score/max(earliest_score, 0.01):.1f}x < {quality_gap_ratio}x")
+        return ReferenceEntry(*earliest_best)
+
     def has_references(self, entity_id: str) -> bool:
         """检查某实体是否有历史参考"""
         conn = sqlite3.connect(self.db_path)

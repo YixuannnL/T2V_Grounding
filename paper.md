@@ -341,7 +341,38 @@ The registry supports three key operations:
 
 For character entities, we use the specialized \texttt{query\_anchor} method with the \textbf{earliest high-quality} strategy (Section~3.2), which considers both shot order and a high-quality threshold $\tau_{\text{high}}$ to select the optimal anchor reference.
 
-An important property: the registry accumulates references \textbf{across shots}. By shot $n$, the registry contains references extracted from $v_1, \ldots, v_{n-1}$, meaning each subsequent shot benefits from progressively more diverse reference images. However, due to the anchor strategy, character references are always drawn from early shots to maintain appearance fidelity.
+\textbf{Location Anchor Strategy.} Location entities present a distinct challenge: Shot~1 may be a close-up where the background is blurred due to depth-of-field effects, while a subsequent wide shot may have a much clearer background. To address this, we introduce a specialized \textbf{``earliest unless much worse''} strategy for locations:
+
+\begin{enumerate}
+    \item If the earliest shot's background quality $\geq \tau_{\text{loc}}^{\text{high}}$ (default 0.7), select it.
+    \item Otherwise, find the highest-quality background across all shots. If $q_{\text{best}} / q_{\text{earliest}} \geq \rho_{\text{gap}}$ (default 1.5), select the better background.
+    \item Otherwise, default to the earliest shot to prevent scene drift.
+\end{enumerate}
+
+Formally:
+\begin{equation}
+\mathcal{I}_{\text{loc}}(e) = \begin{cases}
+\mathcal{R}[e, 1] & \text{if } q(\mathcal{R}[e, 1]) \geq \tau_{\text{loc}}^{\text{high}} \\
+\mathcal{R}[e, s^*] & \text{if } q_{\text{best}} / q_{\text{earliest}} \geq \rho_{\text{gap}} \\
+\mathcal{R}[e, 1] & \text{otherwise}
+\end{cases}
+\end{equation}
+where $s^* = \argmax_s q(\mathcal{R}[e, s])$ is the shot with the highest-quality location reference.
+
+This strategy balances scene consistency (preferring early shots) with quality awareness (allowing switches when later shots have dramatically better backgrounds, e.g., due to close-up vs.\ wide shot differences).
+
+\textbf{Location-Specific Quality Scoring.} Standard quality metrics (face confidence, frontal score) are meaningless for location entities. We introduce a specialized scoring function:
+\begin{equation}
+q_{\text{loc}}(c) = 0.5 \cdot q_{\text{sharp}}(c) + 0.3 \cdot q_{\text{rich}}(c) + 0.2 \cdot (1 - q_{\text{inpaint}}(c))
+\end{equation}
+where:
+\begin{itemize}
+    \item $q_{\text{sharp}}$: Laplacian variance (same as character), heavily weighted to reject blurry backgrounds
+    \item $q_{\text{rich}}$: Content richness measured by Canny edge density and color variance
+    \item $q_{\text{inpaint}}$: Penalty for white/overexposed regions (artifacts from foreground removal)
+\end{itemize}
+
+An important property: the registry accumulates references \textbf{across shots}. By shot $n$, the registry contains references extracted from $v_1, \ldots, v_{n-1}$, meaning each subsequent shot benefits from progressively more diverse reference images. However, due to the anchor strategies, character references are drawn from early high-quality shots, and location references balance early consistency with quality awareness.
 
 % ----------------------------------------------------------------------------
 \subsection{Agentic Orchestration Loop}
