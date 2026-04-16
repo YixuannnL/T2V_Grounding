@@ -36,11 +36,18 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from entity_parser.parser import EntityParser, ParseResult, Entity
+from entity_parser.parser import EntityParser, ParseResult, Entity, EntityCountInfo, CloseupLightingAnalysis
 from visual_grounding.grounder import VideoGrounder, extract_frames
 from visual_grounding.reid import ReferenceQualityScorer
 from reference_manager.registry import EntityRegistry, ReferenceEntry
 from generator.ref2video import Reference2VideoGenerator, GenerationConfig
+from verification.entity_count_verifier import (
+    EntityCountVerifier,
+    EntityCountExpectation,
+    VerificationResult,
+    VerificationStatus,
+    build_count_enhanced_prompt,
+)
 
 
 @dataclass
@@ -79,6 +86,7 @@ class T2VGroundingPipeline:
         llm_model: str = "claude-opus-4-6-qmt",
         grounding_threshold: float = 0.35,
         min_ref_quality: float = 0.4,
+        high_quality_threshold: float = 0.85,  # 高质量正脸阈值，用于锚点选择
         max_refs_per_entity: int = 3,
         wan2_t2v_dir: str = "weights/Wan2.1-T2V-14B",
         phantom_ckpt: str = "weights/Phantom",
@@ -94,6 +102,10 @@ class T2VGroundingPipeline:
         guide_scale_text: float = 7.5,
         guide_scale_img: float = 5.0,
         seed: int = -1,
+        # ── Shot 1 验证参数 ──
+        enable_shot1_verification: bool = True,
+        shot1_max_retries: int = 3,
+        shot1_verify_person_count: bool = True,
     ):
         import torch
         import torch.distributed as dist
@@ -107,7 +119,13 @@ class T2VGroundingPipeline:
         self.device = device
         self.mock_mode = (gen_backend == "mock")
         self.min_ref_quality = min_ref_quality
+        self.high_quality_threshold = high_quality_threshold
         self.max_refs_per_entity = max_refs_per_entity
+
+        # Shot 1 验证参数
+        self.enable_shot1_verification = enable_shot1_verification
+        self.shot1_max_retries = shot1_max_retries
+        self.shot1_verify_person_count = shot1_verify_person_count
 
         if self.is_rank0:
             for sub in ["frames", "crops", "videos", "registry", "selected_refs", "prompts", "used_refs"]:
@@ -127,9 +145,16 @@ class T2VGroundingPipeline:
                     device=device, box_threshold=grounding_threshold
                 )
                 self.scorer = ReferenceQualityScorer(device=device)
+                # 初始化验证器
+                self.verifier = EntityCountVerifier(
+                    grounder=self.grounder,
+                    detection_threshold=grounding_threshold,
+                    device=device,
+                )
             else:
                 self.grounder = None
                 self.scorer = None
+                self.verifier = None
 
         # 所有 rank 都初始化 generator（参与模型推理）
         # 保存 base_seed，每个 shot 会递增使用不同的 seed
@@ -195,6 +220,12 @@ class T2VGroundingPipeline:
             ]
             print(f"[Pipeline] 实体: {[e.entity_id for e in high_priority]}")
 
+            # 打印实体数量预期（用于 Shot 1 验证）
+            if parse_result.entity_counts:
+                for ec in parse_result.entity_counts:
+                    print(f"[Pipeline] 预期 {ec.entity_type}: {ec.expected_count} "
+                          f"({'显式' if ec.is_explicit else '推断'})")
+
             reference_used: dict = {}
             all_ref_paths: List[str] = []
 
@@ -215,32 +246,75 @@ class T2VGroundingPipeline:
                 key=lambda e: priority_order.get(e.grounding_priority, 2)
             )
 
-            # 根据镜头类型决定是否传 location 参考图：
-            # - close-up: 不传 location（背景虚化/模糊，突出主体）
-            #             角色数量由实际解析结果决定（可能是多人 close-up）
-            # - wide/medium: 传 location 保持场景一致性
+            # ── Agentic 镜头类型处理：智能决定是否传 location ──────────────────
+            # 策略：
+            #   - wide/medium shot: 始终传 location（场景一致性）
+            #   - close-up shot: 由 LLM 分析光线复杂度，决定是否传 location
+            #     - 简单光线：不传 location，通过 prompt 描述光线
+            #     - 复杂光线：传 location，保持色调一致
+            #
             # 注意：Phantom 最多支持 4 张参考图
+            closeup_lighting_analysis = None  # 用于后续 prompt 构建
+
             if is_closeup:
-                include_location = False
-                # close-up 不传 location，所以角色可以用满 4 张
-                max_non_loc_refs = 4
-                print(f"[Pipeline] 检测到 close-up 镜头，不使用 location 参考图")
+                # Close-up 镜头：Agentic 决策是否需要 location
+                print(f"[Pipeline] 检测到 close-up 镜头，启动 Agentic 光线分析...")
+
+                # 检查是否有 location 参考图可用
+                has_location_ref = False
+                for loc_entity in location_entities:
+                    refs = self.registry.query(
+                        loc_entity.entity_id, top_k=1,
+                        min_quality=0.3,
+                        anchor_strategy="earliest_good"
+                    )
+                    if refs:
+                        has_location_ref = True
+                        break
+
+                if has_location_ref and location_entities:
+                    # 调用 LLM 分析光线复杂度
+                    closeup_lighting_analysis = self.parser.analyze_closeup_lighting(location_entities)
+
+                    if closeup_lighting_analysis and closeup_lighting_analysis.needs_location_ref:
+                        # LLM 判断需要传 location
+                        include_location = True
+                        max_non_loc_refs = 3
+                        print(f"[Pipeline] Agentic 决策: 传 location 参考图 "
+                              f"(complexity={closeup_lighting_analysis.complexity_score}, "
+                              f"reason='{closeup_lighting_analysis.reason}')")
+                    else:
+                        # LLM 判断不需要传 location，通过 prompt 描述光线
+                        include_location = False
+                        max_non_loc_refs = 4
+                        print(f"[Pipeline] Agentic 决策: 不传 location，通过 prompt 描述光线")
+                        if closeup_lighting_analysis:
+                            print(f"[Pipeline] 光线描述: {closeup_lighting_analysis.lighting_description}")
+                else:
+                    # 没有 location 参考图可用，跳过分析
+                    include_location = False
+                    max_non_loc_refs = 4
+                    print(f"[Pipeline] Close-up 镜头，无可用 location 参考图")
+
             elif is_wide:
                 include_location = True
                 max_non_loc_refs = 3 if location_entities else 4
+                print(f"[Pipeline] 检测到 wide shot 镜头，传 location 参考图")
             else:
+                # medium shot
                 include_location = True
                 max_non_loc_refs = 3 if location_entities else 4
 
             # ── 关键改动：使用锚点策略，防止误差累积 ──────────────────────────
-            # 对于 character，优先使用最早出现的高质量参考图（锚点）
-            # 而不是最近 shot 的 grounding 结果（可能已经有偏移）
+            # 对于 character，优先使用"最早的大正脸"参考图（锚点）
+            # 策略：高质量正脸 > 早期出现，但同等高质量选更早的
             for entity in sorted_non_loc[:max_non_loc_refs]:
-                # character 使用更严格的锚点查询
+                # character 使用锚点查询：优先选择高质量正脸
                 if entity.type == "character":
                     anchor = self.registry.query_anchor(
                         entity.entity_id,
-                        min_quality=self.min_ref_quality
+                        min_quality=self.min_ref_quality,
+                        high_quality_threshold=self.high_quality_threshold,
                     )
                     if anchor:
                         reference_used[entity.entity_id] = [anchor.crop_path]
@@ -258,9 +332,8 @@ class T2VGroundingPipeline:
                         reference_used[entity.entity_id] = [refs[0].crop_path]
                         all_ref_paths.append(refs[0].crop_path)
 
-            # ── 处理 location 实体（场景一致性）────────────────────────────────
-            # close-up 镜头不传 location 参考图，让模型自由生成背景
-            # location 也使用锚点策略，保持场景一致性
+            # ── 处理 location 实体（场景一致性 / 光线一致性）────────────────────
+            # 根据上面的 Agentic 决策结果决定是否传 location
             if include_location:
                 for loc_entity in location_entities:
                     refs = self.registry.query(
@@ -275,8 +348,6 @@ class T2VGroundingPipeline:
                               f"(shot={refs[0].shot_id})")
                     else:
                         print(f"[Pipeline] Location '{loc_entity.entity_id}' 无参考图 (新场景，将在生成后 grounding)")
-            else:
-                print(f"[Pipeline] close-up 镜头，跳过 location 参考图")
 
             generation_mode = "phantom" if all_ref_paths and not self.mock_mode else \
                               ("t2v" if not self.mock_mode else "mock")
@@ -285,10 +356,11 @@ class T2VGroundingPipeline:
                   f"location: {len([e for e in location_entities if e.entity_id in reference_used])})")
 
             # ── 构建生成 prompt ────────────────────────────────────────────────
-            # Prompt 分为三层：
-            #   1. global_context: 全局风格/氛围/叙事背景（不含具体实体，跨越所有镜头）
-            #   2. shot_context:   本 shot 出现的实体的外观/属性描述
-            #   3. shot.text:      本 shot 的具体动作/事件描述
+            # Prompt 分层：
+            #   1. global_context: 全局风格/氛围/叙事背景
+            #   2. lighting_context: Close-up 光线引导（仅当不传 location 时）
+            #   3. shot_context:   本 shot 出现的实体描述
+            #   4. shot.text:      本 shot 的具体动作描述
             #
             # 不直接使用原始 global_caption 全文，因为它描述整个视频叙事，
             # 会把当前 shot 不应出现的实体（如后续 shot 才登场的角色）注入 prompt，
@@ -301,13 +373,20 @@ class T2VGroundingPipeline:
                 prompt_parts.append(global_context)
                 print(f"[Pipeline] Global context:\n{global_context}")
 
-            # Layer 2: 当前 shot 的实体描述
+            # Layer 2: Close-up 光线引导（仅当不传 location 参考图时）
+            if is_closeup and not include_location and closeup_lighting_analysis:
+                lighting_prompt = self.parser.build_closeup_lighting_prompt(closeup_lighting_analysis)
+                if lighting_prompt:
+                    prompt_parts.append(lighting_prompt)
+                    print(f"[Pipeline] Lighting context:\n{lighting_prompt}")
+
+            # Layer 3: 当前 shot 的实体描述
             shot_context = self.parser.build_shot_context(parse_result)
             if shot_context:
                 prompt_parts.append(f"[Shot Entities]\n{shot_context}")
                 print(f"[Pipeline] Shot context:\n{shot_context}")
 
-            # Layer 3: 当前 shot 的动作描述
+            # Layer 4: 当前 shot 的动作描述
             prompt_parts.append(shot.text)
 
             gen_prompt = "\n\n".join(prompt_parts)
@@ -349,17 +428,37 @@ class T2VGroundingPipeline:
                 f.write(gen_prompt)
             print(f"[Pipeline] Prompt 已保存: {prompt_path}")
 
+            # ── Shot 1 验证：检查是否需要验证循环 ──────────────────────────────
+            # 条件：T2V 模式 + 开启验证 + 有人数预期
+            needs_verification = (
+                generation_mode == "t2v" and
+                self.enable_shot1_verification and
+                self.shot1_verify_person_count and
+                not self.mock_mode and
+                parse_result.entity_counts
+            )
+            # 提取人数预期
+            person_count_expectation = None
+            if needs_verification:
+                for ec in parse_result.entity_counts:
+                    if ec.entity_type == "character":
+                        person_count_expectation = ec.expected_count
+                        break
+
             # 广播给其他 rank
-            broadcast_data = [gen_prompt, all_ref_paths, generation_mode]
+            broadcast_data = [
+                gen_prompt, all_ref_paths, generation_mode,
+                needs_verification, person_count_expectation, parse_result
+            ]
         else:
-            broadcast_data = [None, None, None]
+            broadcast_data = [None, None, None, False, None, None]
 
         if self.world_size > 1 and dist.is_initialized():
             dist.broadcast_object_list(broadcast_data, src=0)
 
-        prompt, all_ref_paths, generation_mode = broadcast_data
+        prompt, all_ref_paths, generation_mode, needs_verification, person_count_expectation, parse_result = broadcast_data
 
-        # ── Step 3: 所有 rank 加载参考图并生成 ───────────────────────────────
+        # ── Step 3: 生成视频（可能包含验证循环）───────────────────────────────
         all_ref_images: List[Image.Image] = []
         for p in (all_ref_paths or []):
             try:
@@ -371,17 +470,28 @@ class T2VGroundingPipeline:
             self.output_dir, "videos", f"shot_{shot.shot_id:03d}.mp4"
         )
 
-        # 每个 shot 使用不同的 seed，增加生成多样性
-        shot_seed = self.base_seed + shot.shot_id
-        self.generator.config.seed = shot_seed
-        if self.is_rank0:
-            print(f"[Pipeline] 使用 seed: {shot_seed} (base={self.base_seed}, shot_id={shot.shot_id})")
+        # Shot 1 验证循环
+        if needs_verification and person_count_expectation is not None:
+            video_path, verification_metadata = self._generate_with_verification(
+                shot=shot,
+                prompt=prompt,
+                all_ref_images=all_ref_images,
+                video_path=video_path,
+                expected_person_count=person_count_expectation,
+            )
+        else:
+            # 普通生成（无验证）
+            shot_seed = self.base_seed + shot.shot_id
+            self.generator.config.seed = shot_seed
+            if self.is_rank0:
+                print(f"[Pipeline] 使用 seed: {shot_seed} (base={self.base_seed}, shot_id={shot.shot_id})")
 
-        self.generator.generate(
-            text_prompt=prompt,
-            references=all_ref_images,
-            output_path=video_path,
-        )
+            self.generator.generate(
+                text_prompt=prompt,
+                references=all_ref_images,
+                output_path=video_path,
+            )
+            verification_metadata = {"verified": False}
 
         # ── Step 4: rank 0 做 grounding → 入库 ───────────────────────────────
         if not self.is_rank0:
@@ -408,8 +518,127 @@ class T2VGroundingPipeline:
             entity_ids=[e.entity_id for e in parse_result.entities],
             reference_used=reference_used,
             grounded_entities=grounded_entities,
-            metadata={"gen_prompt": prompt},  # 也存入 metadata 供 report 使用
+            metadata={
+                "gen_prompt": prompt,
+                "verification": verification_metadata,
+            },
         )
+
+    def _generate_with_verification(
+        self,
+        shot: ShotConfig,
+        prompt: str,
+        all_ref_images: List[Image.Image],
+        video_path: str,
+        expected_person_count: int,
+    ) -> tuple:
+        """
+        带验证的生成循环（仅用于 Shot 1 T2V 模式）
+
+        流程:
+          1. 生成视频
+          2. 检测人数
+          3. 如果人数不匹配，换 seed 重试
+          4. 如果多次重试仍不匹配，增强 prompt 再试
+          5. 最多 max_retries 次，超出则返回最后一次结果并警告
+
+        Returns:
+            (video_path, metadata_dict)
+        """
+        import torch.distributed as dist
+
+        max_retries = self.shot1_max_retries
+        current_prompt = prompt
+        retry_history = []
+
+        for attempt in range(max_retries + 1):
+            # 计算当前 seed
+            shot_seed = self.base_seed + shot.shot_id + attempt * 1000
+            self.generator.config.seed = shot_seed
+
+            # 第 2 轮及以后使用增强 prompt
+            if attempt >= 2 and attempt == 2:
+                current_prompt = build_count_enhanced_prompt(prompt, expected_person_count)
+                if self.is_rank0:
+                    print(f"[Verify] 使用增强 prompt (强调人数={expected_person_count})")
+
+            if self.is_rank0:
+                attempt_str = f"[Verify] 尝试 {attempt + 1}/{max_retries + 1}"
+                print(f"{attempt_str}: seed={shot_seed}")
+
+            # 生成
+            self.generator.generate(
+                text_prompt=current_prompt,
+                references=all_ref_images,
+                output_path=video_path,
+            )
+
+            # 只有 rank 0 做验证
+            if not self.is_rank0:
+                # 非 rank 0 等待验证结果广播
+                if self.world_size > 1 and dist.is_initialized():
+                    verify_result = [None]
+                    dist.broadcast_object_list(verify_result, src=0)
+                    passed = verify_result[0]
+                    if passed:
+                        break
+                continue
+
+            # rank 0 执行验证
+            expectations = [
+                EntityCountExpectation(
+                    entity_type="person",
+                    expected_count=expected_person_count,
+                    description=f"{expected_person_count} person(s)",
+                    tolerance=0,
+                    is_critical=True,
+                )
+            ]
+
+            verify_result = self.verifier.verify(
+                video_path=video_path,
+                expectations=expectations,
+                sample_frames=3,
+                temp_dir=os.path.join(self.output_dir, "verify_frames", f"shot_{shot.shot_id:03d}"),
+            )
+
+            retry_history.append({
+                "attempt": attempt + 1,
+                "seed": shot_seed,
+                "status": verify_result.status.value,
+                "expected": verify_result.expected_counts,
+                "actual": verify_result.actual_counts,
+                "enhanced_prompt": attempt >= 2,
+            })
+
+            print(f"[Verify] 结果: {verify_result.status.value} | "
+                  f"预期={verify_result.expected_counts} | "
+                  f"实际={verify_result.actual_counts}")
+
+            # 广播验证结果
+            if self.world_size > 1 and dist.is_initialized():
+                dist.broadcast_object_list([verify_result.passed], src=0)
+
+            if verify_result.passed:
+                print(f"[Verify] ✅ 验证通过！人数匹配")
+                break
+            elif attempt < max_retries:
+                print(f"[Verify] ❌ 人数不匹配，准备重试...")
+            else:
+                print(f"[Verify] ⚠️ 达到最大重试次数，使用最后结果")
+                print(f"[Verify] 警告: 生成的人数 ({verify_result.actual_counts.get('person', '?')}) "
+                      f"与预期 ({expected_person_count}) 不符！")
+
+        metadata = {
+            "verified": True,
+            "final_attempt": len(retry_history),
+            "final_passed": retry_history[-1]["status"] == "passed" if retry_history else False,
+            "expected_person_count": expected_person_count,
+            "actual_person_count": retry_history[-1]["actual"].get("person", -1) if retry_history else -1,
+            "retry_history": retry_history,
+        }
+
+        return video_path, metadata
 
     # ── 生成后 Grounding & 入库 ───────────────────────────────────────────────
 

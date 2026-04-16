@@ -133,27 +133,35 @@ class EntityRegistry:
         self,
         entity_id: str,
         min_quality: float = 0.5,
+        high_quality_threshold: float = 0.85,
     ) -> Optional[ReferenceEntry]:
         """
-        获取实体的"锚点"参考图：最早出现的高质量参考
+        获取实体的"锚点"参考图：最早出现的高质量正脸参考
 
-        这是防止误差累积的核心方法：
-        - 优先选择最早 shot（shot_id 最小）
-        - 在最早 shot 中选质量最高的
-        - 如果最早 shot 质量不达标，才考虑后续 shot
+        改进策略 "earliest_high_quality"：
+        ─────────────────────────────────────────────────────────
+        核心问题：Shot 1 可能是侧脸/部分脸，Shot 2+ 的 close-up 可能有更清晰的正脸。
+
+        规则（按优先级）：
+        1. 如果最早 shot 有 ≥ high_quality_threshold (默认 0.85) 的参考图 → 选它
+        2. 如果最早 shot 只有中等质量 (min_quality ~ high_quality_threshold)：
+           - 查找所有 shot 中最早的高质量参考图 (≥ high_quality_threshold)
+           - 如果找到 → 选它（高质量正脸优先于早期出现）
+           - 如果没有 → 回退选最早 shot 的最佳参考（防止误差累积）
+        3. 同等高质量时，选 shot_id 更小的（更早出现）
 
         Args:
-            entity_id:    实体 ID
-            min_quality:  锚点要求的最低质量（应该比普通查询更严格）
+            entity_id:              实体 ID
+            min_quality:            基础质量阈值
+            high_quality_threshold: 高质量阈值（超过此分数视为"大正脸"）
 
         Returns:
             最佳锚点参考图，或 None
         """
         conn = sqlite3.connect(self.db_path)
 
-        # 策略：先找最早 shot 中质量最高的
-        # 如果最早 shot 没有达标的，再找所有 shot 中质量最高的
-        row = conn.execute("""
+        # Step 1: 找最早 shot 中质量最高的参考图
+        earliest_best = conn.execute("""
             SELECT entity_id, shot_id, frame_path, crop_path, quality_score, source, created_at
             FROM ref_entries
             WHERE entity_id = ? AND quality_score >= ?
@@ -161,11 +169,44 @@ class EntityRegistry:
             LIMIT 1
         """, (entity_id, min_quality)).fetchone()
 
+        if earliest_best is None:
+            conn.close()
+            return None
+
+        earliest_score = earliest_best[4]  # quality_score
+        earliest_shot = earliest_best[1]   # shot_id
+
+        # Step 2: 如果最早 shot 已经是高质量，直接返回
+        if earliest_score >= high_quality_threshold:
+            conn.close()
+            print(f"[Registry] 锚点选择: {entity_id} | 最早shot已高质量 "
+                  f"(shot={earliest_shot}, score={earliest_score:.2f})")
+            return ReferenceEntry(*earliest_best)
+
+        # Step 3: 最早 shot 质量中等，查找后续 shot 中是否有高质量参考
+        # 找所有 shot 中最早的高质量参考图
+        high_quality_anchor = conn.execute("""
+            SELECT entity_id, shot_id, frame_path, crop_path, quality_score, source, created_at
+            FROM ref_entries
+            WHERE entity_id = ? AND quality_score >= ?
+            ORDER BY shot_id ASC, quality_score DESC
+            LIMIT 1
+        """, (entity_id, high_quality_threshold)).fetchone()
+
         conn.close()
 
-        if row:
-            return ReferenceEntry(*row)
-        return None
+        if high_quality_anchor is not None:
+            hq_shot = high_quality_anchor[1]
+            hq_score = high_quality_anchor[4]
+            print(f"[Registry] 锚点选择: {entity_id} | 选择后续高质量正脸 "
+                  f"(shot={hq_shot}, score={hq_score:.2f}) 优于最早shot "
+                  f"(shot={earliest_shot}, score={earliest_score:.2f})")
+            return ReferenceEntry(*high_quality_anchor)
+
+        # Step 4: 没有高质量参考，回退选最早 shot（防误差累积）
+        print(f"[Registry] 锚点选择: {entity_id} | 无高质量参考，回退选最早shot "
+              f"(shot={earliest_shot}, score={earliest_score:.2f})")
+        return ReferenceEntry(*earliest_best)
 
     def has_references(self, entity_id: str) -> bool:
         """检查某实体是否有历史参考"""

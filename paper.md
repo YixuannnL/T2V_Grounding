@@ -48,7 +48,7 @@ Omit for now.
 
 We introduce T2V-Grounding, an agentic pipeline for multi-shot video generation with cross-shot entity consistency. Given a multi-shot script $\mathcal{S} = \{s_1, s_2, \ldots, s_N\}$ where each shot $s_n$ is a natural language description, and an optional global caption $\mathcal{C}_{\text{global}}$ that describes the overall narrative context, our goal is to generate a sequence of videos $\mathcal{V} = \{v_1, v_2, \ldots, v_N\}$ such that entities appearing across multiple shots maintain consistent visual identity.
 
-The pipeline consists of six components: (1) an LLM-based Entity Parser, (2) a Global Context Extractor, (3) an Entity Registry, (4) a Visual Grounding Module, (5) a Reference Quality Scorer, and (6) an Adaptive Video Generator. These are orchestrated by an agentic loop that processes shots sequentially. A key design is our \textbf{three-layer prompt construction}, which separates global semantic context (style, mood, setting) from shot-specific entity descriptions and action text, preventing entity leakage across shots while maintaining stylistic coherence.
+The pipeline consists of six components: (1) an LLM-based Entity Parser, (2) a Global Context Extractor, (3) an Entity Registry, (4) a Visual Grounding Module, (5) a Reference Quality Scorer, and (6) an Adaptive Video Generator. These are orchestrated by an agentic loop that processes shots sequentially. A key design is our \textbf{four-layer prompt construction}, which separates global semantic context, lighting guidance (for close-ups), shot-specific entity descriptions, and action text, preventing entity leakage across shots while maintaining stylistic and lighting coherence.
 
 % ----------------------------------------------------------------------------
 \subsection{LLM-Based Entity Parser with Cross-Shot Coreference}
@@ -90,6 +90,36 @@ Given the entity list $\mathcal{E}_n$ and the Entity Registry state $\mathcal{R}
 v_n = \mathcal{G}_{\text{T2V}}(s_n)
 \end{equation}
 
+\textbf{Shot 1 Entity Count Verification.} A critical observation is that T2V generation without reference constraints is prone to \emph{entity count errors}: if the prompt describes ``three men'', the model may generate four people. Since all subsequent shots depend on Shot 1's grounding results as anchors, such errors propagate and amplify throughout the entire multi-shot sequence.
+
+To address this, we introduce a \textbf{Generation-Verification Loop} specifically for T2V mode (primarily Shot 1):
+
+\begin{enumerate}
+    \item \textbf{Entity Count Extraction.} During LLM parsing, we extract expected entity counts from the shot description. For each entity type $t$ (character, object), we compute:
+    \begin{equation}
+    N_t^{\text{expected}} = |\{e \in \mathcal{E}_n : e.\text{type} = t\}|
+    \end{equation}
+
+    \item \textbf{Post-Generation Verification.} After generating $v_n$, we sample $K$ frames uniformly and run person detection with NMS deduplication:
+    \begin{equation}
+    N_{\text{person}}^{\text{actual}} = \text{mode}(\{\text{count}(\text{Detect}(f_k)) : f_k \in \mathcal{F}_{\text{sample}}\})
+    \end{equation}
+    where we take the mode (most frequent count) across sampled frames for robustness.
+
+    \item \textbf{Verification and Retry.} If $N_{\text{person}}^{\text{actual}} \neq N_{\text{person}}^{\text{expected}}$:
+    \begin{itemize}
+        \item Attempt 1-2: Retry with different random seed ($\text{seed}' = \text{seed} + 1000$)
+        \item Attempt 3+: Use an \textbf{enhanced prompt} with explicit count constraint:
+        \begin{equation}
+        s_n' = \texttt{``[IMPORTANT: exactly } N \texttt{ people]''} \oplus s_n
+        \end{equation}
+    \end{itemize}
+
+    \item \textbf{Termination.} Accept the generation if counts match, or after $M_{\text{max}}$ retries (default 3), warn the user and proceed with the best available result.
+\end{enumerate}
+
+This verification loop ensures that the ``anchor'' references established in Shot 1 are semantically correct, preventing error accumulation in subsequent shots.
+
 \textbf{S2V Mode (subsequent shots with references).} When the registry contains reference crops for at least one high-priority entity in shot $n$, we switch to a subject-to-video model $\mathcal{G}_{\text{S2V}}$:
 \begin{equation}
 v_n = \mathcal{G}_{\text{S2V}}(s_n,\ \mathcal{I}_n)
@@ -98,26 +128,60 @@ where $\mathcal{I}_n$ is the set of reference images retrieved from the registry
 
 \textbf{Why S2V and not I2V?} Image-to-video models treat the reference image as the first video frame, strongly constraining both appearance \emph{and} spatial layout/pose. This makes I2V unsuitable for shots with different camera angles or actions. S2V models like Phantom instead encode reference images as appearance tokens in a parallel conditioning stream, exerting appearance-level influence without fixing spatial structure.
 
-\textbf{Reference Image Retrieval with Anchor Strategy.} A critical observation is that \emph{appearance drift accumulates across shots}: the later a shot is generated, the more likely the character's face deviates from its original appearance. If we always use the most recent shot's grounding result as the reference, errors compound progressively.
+\textbf{Reference Image Retrieval with Earliest High-Quality Anchor Strategy.} A critical observation is that \emph{appearance drift accumulates across shots}: the later a shot is generated, the more likely the character's face deviates from its original appearance. If we always use the most recent shot's grounding result as the reference, errors compound progressively.
 
-To address this, we introduce an \textbf{anchor strategy} for character entities: instead of retrieving the most recent reference, we always retrieve the \textbf{earliest high-quality reference} (the ``anchor'') for each entity. This ensures that all shots reference the original, uncontaminated appearance established in the entity's first appearance.
+A naive anchor strategy would simply select the earliest shot's reference. However, we observe that \textbf{the earliest shot is not always the best}: Shot 1 (typically a wide shot) may capture a character in profile or partial view, while Shot 2 (often a close-up) provides a clearer frontal face. Blindly selecting the earliest reference can lock in a poor-quality side profile.
+
+To address this, we introduce an \textbf{``earliest high-quality''} anchor strategy that balances recency with quality:
+
+\begin{enumerate}
+    \item If the earliest shot contains a reference with quality $\geq \tau_{\text{high}}$ (default 0.85), select it.
+    \item Otherwise, search all shots for the \emph{earliest} reference with quality $\geq \tau_{\text{high}}$.
+    \item If no high-quality reference exists across all shots, fall back to the earliest shot's best reference (to still prevent drift accumulation).
+\end{enumerate}
 
 \begin{equation}
-\mathcal{I}_{\text{anchor}}(e) = \mathcal{R}.\texttt{query\_anchor}(e.\text{entity\_id},\ \tau_q=0.5)
+\mathcal{I}_{\text{anchor}}(e) = \begin{cases}
+\mathcal{R}[e, \text{shot}=1] & \text{if } q(\mathcal{R}[e, \text{shot}=1]) \geq \tau_{\text{high}} \\
+\arg\min_{\text{shot}} \{\mathcal{R}[e, \text{shot}] : q \geq \tau_{\text{high}}\} & \text{if } \exists \text{ high-quality ref} \\
+\mathcal{R}[e, \text{shot}=1] & \text{otherwise (fallback)}
+\end{cases}
 \end{equation}
 
-where \texttt{query\_anchor} returns the entry with minimum \texttt{shot\_id} among all entries with quality $\geq \tau_q$.
+This strategy ensures that: (1) when a clear frontal face is captured early, it becomes the anchor; (2) when the earliest shot only has a poor-quality side profile but a later close-up provides a better reference, the system intelligently selects the higher-quality option; (3) ties are broken in favor of earlier shots to minimize drift.
 
-\textbf{Shot-Type Adaptive Reference Selection.} We observe that the optimal reference set depends on the shot type. Specifically, close-up shots benefit from \emph{not} including location references, as this allows the background to naturally blur or defocus, emphasizing the subject. We automatically detect shot types via keyword matching and adapt reference selection accordingly:
+\textbf{Agentic Light-Aware Close-up Strategy.} A naive approach excludes location references for all close-up shots to allow background defocus. However, this causes lighting and color tone inconsistencies---a close-up in a warm, golden-lit office may have completely different lighting than the establishing shot.
+
+We introduce an \textbf{agentic decision mechanism} where an LLM analyzes the lighting complexity of the current location and decides whether to include the location reference:
+
+\begin{enumerate}
+    \item \textbf{Lighting Complexity Analysis.} For close-up shots with available location references, we query the LLM to analyze the scene's lighting characteristics:
+    \begin{equation}
+    (\text{lighting\_desc}, c_{\text{score}}, \text{needs\_ref}) = \mathcal{M}_{\text{LLM}}(\mathcal{E}_n^{\text{loc}}, \mathcal{G})
+    \end{equation}
+    where $c_{\text{score}} \in [1,5]$ is the lighting complexity score.
+
+    \item \textbf{Adaptive Decision.}
+    \begin{itemize}
+        \item $c_{\text{score}} \leq 2$ (simple lighting): Uniform daylight, single light source. Text description is sufficient---exclude location reference, inject lighting description into prompt.
+        \item $c_{\text{score}} \geq 3$ (complex lighting): Multiple colored sources, warm reflections, backlighting. Include location reference to maintain color tone consistency.
+    \end{itemize}
+
+    \item \textbf{Lighting Context Injection.} When location is excluded, we inject a ``Lighting Context'' layer into the prompt describing the scene's lighting characteristics, color tone, and depth-of-field guidance.
+\end{enumerate}
+
+This agentic approach ensures that close-ups maintain visual coherence with the overall scene while preserving the artistic intent of subject isolation.
+
+\textbf{Shot-Type Adaptive Reference Selection.} Building on the agentic lighting analysis, we adapt reference selection based on shot type:
 
 \begin{center}
 \begin{tabular}{lcc}
 \toprule
-\textbf{Shot Type} & \textbf{Keywords} & \textbf{Include Location} \\
+\textbf{Shot Type} & \textbf{Keywords} & \textbf{Location Decision} \\
 \midrule
-Close-up & ``close-up'', ``tight shot'' & No \\
-Wide shot & ``wide shot'', ``establishing'' & Yes \\
-Medium (default) & -- & Yes \\
+Close-up & ``close-up'', ``tight shot'' & Agentic (LLM decides) \\
+Wide shot & ``wide shot'', ``establishing'' & Always include \\
+Medium (default) & -- & Always include \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -143,28 +207,35 @@ If a location entity has no registry entry, it is treated as a \emph{new scene}-
 The final reference set is $\mathcal{I}_n = \mathcal{I}_{\text{non-loc}} \cup \mathcal{I}_{\text{loc|}|}$, capped at 4 images (the S2V model's maximum).
 
 % ----------------------------------------------------------------------------
-\subsection{Three-Layer Prompt Construction}
+\subsection{Four-Layer Prompt Construction}
 
-A naive approach would directly concatenate the \texttt{global\_caption} with the shot description. However, this introduces a critical problem: the global caption typically describes the entire video narrative, potentially mentioning characters or events that should not appear in the current shot. To address this, we construct the generation prompt in three carefully designed layers:
+A naive approach would directly concatenate the \texttt{global\_caption} with the shot description. However, this introduces a critical problem: the global caption typically describes the entire video narrative, potentially mentioning characters or events that should not appear in the current shot. To address this, we construct the generation prompt in four carefully designed layers:
 
 \textbf{Layer 1: Global Context.} Semantic attributes extracted from the global caption that apply uniformly across all shots: visual style, mood, setting, and narrative context. This layer explicitly excludes specific entity descriptions.
 \begin{equation}
 \text{prompt}_{\text{global}} = \texttt{BuildGlobalContext}(\mathcal{C}_{\text{global}})
 \end{equation}
 
-\textbf{Layer 2: Shot Entity Context.} Detailed descriptions of entities that \emph{actually appear in the current shot}, retrieved from the entity graph. For each entity $e \in \mathcal{E}_n$ with priority $\neq \texttt{low}$, we format its attributes as:
+\textbf{Layer 2: Lighting Context (Conditional).} For close-up shots where the agentic analysis decides \emph{not} to include location references, we inject lighting guidance derived from the location analysis. This ensures close-ups maintain consistent lighting and color tone with the overall scene:
+\begin{equation}
+\text{prompt}_{\text{lighting}} = \texttt{BuildLightingContext}(\text{lighting\_desc}, \text{color\_tone})
+\end{equation}
+This layer is only included when: (1) the shot is a close-up, (2) location references are excluded, and (3) lighting analysis is available.
+
+\textbf{Layer 3: Shot Entity Context.} Detailed descriptions of entities that \emph{actually appear in the current shot}, retrieved from the entity graph. For each entity $e \in \mathcal{E}_n$ with priority $\neq \texttt{low}$, we format its attributes as:
 \begin{equation}
 \text{prompt}_{\text{entity}} = \bigcup_{e \in \mathcal{E}_n} \texttt{FormatEntity}(e.\text{type}, e.\text{desc}, e.\text{attr})
 \end{equation}
 
-\textbf{Layer 3: Shot Description.} The original shot text $s_n$ describing the specific action, camera movement, and composition.
+\textbf{Layer 4: Shot Description.} The original shot text $s_n$ describing the specific action, camera movement, and composition.
 
 The final prompt is constructed as:
 \begin{equation}
-\text{prompt}_n = \text{prompt}_{\text{global}} \oplus \text{prompt}_{\text{entity}} \oplus s_n
+\text{prompt}_n = \text{prompt}_{\text{global}} \oplus [\text{prompt}_{\text{lighting}}] \oplus \text{prompt}_{\text{entity}} \oplus s_n
 \end{equation}
+where $[\cdot]$ denotes conditional inclusion based on the agentic lighting decision.
 
-This three-layer design ensures that: (1) stylistic coherence is maintained across shots via the global context, (2) only relevant entities are described to the generation model, and (3) the original creative intent of each shot is preserved.
+This four-layer design ensures that: (1) stylistic coherence is maintained across shots via the global context, (2) lighting consistency is preserved even when location references are excluded, (3) only relevant entities are described to the generation model, and (4) the original creative intent of each shot is preserved.
 
 % ----------------------------------------------------------------------------
 \subsection{Post-Generation Visual Grounding}
@@ -234,10 +305,12 @@ The registry supports three key operations:
 
 \textbf{Query Strategies.} The \texttt{query} operation supports three ordering strategies:
 \begin{itemize}
-    \item \texttt{earliest\_good} (default): Sort by \texttt{shot\_id} ascending, then quality descending. This implements the anchor strategy, preventing error accumulation.
+    \item \texttt{earliest\_good} (default): Sort by \texttt{shot\_id} ascending, then quality descending. Basic anchor strategy.
     \item \texttt{best\_quality}: Sort by quality descending. May select drifted references from later shots.
     \item \texttt{most\_recent}: Sort by \texttt{shot\_id} descending. Legacy behavior, causes error accumulation.
 \end{itemize}
+
+For character entities, we use the specialized \texttt{query\_anchor} method with the \textbf{earliest high-quality} strategy (Section 3.2), which considers both shot order and a high-quality threshold $\tau_{\text{high}}$ to select the optimal anchor reference.
 
 An important property: the registry accumulates references \textbf{across shots}. By shot $n$, the registry contains references extracted from $v_1, \ldots, v_{n-1}$, meaning each subsequent shot benefits from progressively more diverse reference images. However, due to the anchor strategy, character references are always drawn from early shots to maintain appearance fidelity.
 
@@ -260,13 +333,20 @@ Algorithm~\ref{alg:pipeline} presents the full agentic pipeline. The loop proces
 \FOR{$n = 1, 2, \ldots, N$}
     \STATE $\mathcal{E}_n \leftarrow \text{LLM\_Parse}(s_n, \mathcal{K})$
     \STATE $\mathcal{K} \leftarrow \mathcal{K} \cup \{e \in \mathcal{E}_n : e.\text{is\_new}\}$
-    \STATE $\text{prompt}_n \leftarrow \text{BuildPrompt}(\mathcal{G}, \mathcal{E}_n, s_n)$ \COMMENT{3-layer}
+    \STATE $\text{prompt}_n \leftarrow \text{BuildPrompt}(\mathcal{G}, \mathcal{E}_n, s_n)$ \COMMENT{4-layer}
     \STATE $\text{shot\_type} \leftarrow \text{DetectShotType}(s_n)$ \COMMENT{close-up/wide/medium}
     \STATE $\text{seed}_n \leftarrow \text{seed}_{\text{base}} + n$ \COMMENT{per-shot seed increment}
-    \STATE \COMMENT{Retrieve refs with anchor strategy (earliest high-quality)}
-    \STATE $\mathcal{I}_{\text{char}} \leftarrow \mathcal{R}.\text{query\_anchor}(\mathcal{E}_n^{\text{char}}, \tau_q=0.5)$
+    \STATE \COMMENT{Retrieve refs with earliest high-quality anchor strategy}
+    \STATE $\mathcal{I}_{\text{char}} \leftarrow \mathcal{R}.\text{query\_anchor}(\mathcal{E}_n^{\text{char}}, \tau_q=0.4, \tau_{\text{high}}=0.85)$
     \STATE $\mathcal{I}_{\text{obj}} \leftarrow \mathcal{R}.\text{query}(\mathcal{E}_n^{\text{obj}}, k=1, \tau_q=0.4, \text{earliest})$
-    \IF{$\text{shot\_type} \neq \text{close-up}$}
+    \IF{$\text{shot\_type} = \text{close-up}$}
+        \STATE $\text{light\_analysis} \leftarrow \text{AnalyzeCloseupLighting}(\mathcal{E}_n^{\text{loc}}, \mathcal{G})$
+        \IF{$\text{light\_analysis.needs\_ref} = \texttt{true}$}
+            \STATE $\mathcal{I}_{\text{loc}} \leftarrow \mathcal{R}.\text{query}(\mathcal{E}_n^{\text{loc}}, k=1, \tau_q=0.3)$
+        \ELSE
+            \STATE $\text{prompt}_n \leftarrow \text{InjectLightingContext}(\text{prompt}_n, \text{light\_analysis})$
+        \ENDIF
+    \ELSIF{$\text{shot\_type} \neq \text{close-up}$}
         \STATE $\mathcal{I}_{\text{loc}} \leftarrow \mathcal{R}.\text{query}(\mathcal{E}_n^{\text{loc}}, k=1, \tau_q=0.3, \text{earliest})$
     \ENDIF
     \STATE $\mathcal{I}_n \leftarrow \text{FilterByMaxRefs}(\mathcal{I}_{\text{char}} \cup \mathcal{I}_{\text{obj}} \cup \mathcal{I}_{\text{loc}}, \text{shot\_type})$
