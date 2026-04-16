@@ -37,12 +37,27 @@ class GlobalContext:
 
 
 @dataclass
+class EntityCountInfo:
+    """
+    实体数量信息 —— 用于 Shot 1 验证
+
+    在 T2V 生成后，验证生成的人数是否与 prompt 描述一致。
+    如果不一致（如预期3人但生成4人），需要 retry。
+    """
+    entity_type: str            # "character", "object", etc.
+    expected_count: int         # 预期数量
+    description: str            # 描述来源，如 "three men in suits"
+    is_explicit: bool           # 是否为显式描述（如 "three men" vs 隐式推断）
+
+
+@dataclass
 class ParseResult:
     shot_id: int
     raw_text: str
     entities: List[Entity]
     new_elements: List[str]   # 本镜头新增的无需 reference 的元素（如天气、特效）
     style_ref_shot: Optional[int] = None  # 参考哪个镜头的整体风格
+    entity_counts: List[EntityCountInfo] = field(default_factory=list)  # 实体数量预期
 
 
 SYSTEM_PROMPT = """你是一个专业的影视脚本分析器。
@@ -54,6 +69,11 @@ SYSTEM_PROMPT = """你是一个专业的影视脚本分析器。
    - high: 人物角色（character）、核心互动物体
    - medium: 场景/地点（location）、重要道具 —— 注意：location 类型必须是 medium，不能是 low
    - low: 纯背景元素、不需要跨镜头保持一致的物体
+5. **【重要】统计实体数量**：分析文本中明确或隐含描述的各类实体数量，
+   特别是人物数量。这对于验证生成结果至关重要。
+   - 如果文本说 "three men"，character_count 应为 3
+   - 如果文本说 "a man and a woman"，character_count 应为 2
+   - 如果有多个独立描述的人物，按实际人数统计
 
 **重要**：每个镜头必须包含至少一个 location 类型的实体（type="location"），
 用于描述当前场景环境。location 的 grounding_priority 必须设为 "medium"，
@@ -86,8 +106,20 @@ SYSTEM_PROMPT = """你是一个专业的影视脚本分析器。
     }
   ],
   "new_elements": ["heavy rain", "neon signs"],
-  "style_ref_shot": 1
+  "style_ref_shot": 1,
+  "entity_counts": {
+    "character_count": 2,
+    "character_description": "Alex and a suspect",
+    "object_count": 0,
+    "is_count_explicit": true
+  }
 }
+
+entity_counts 字段说明：
+- character_count: 本镜头中出现的人物总数（必须准确！）
+- character_description: 简要描述这些人物
+- object_count: 需要 grounding 的重要物体数量
+- is_count_explicit: 文本中是否明确提到了数量（如 "three men" 为 true，隐式推断为 false）
 """
 
 
@@ -116,6 +148,53 @@ GLOBAL_CONTEXT_PROMPT = """你是一个专业的影视脚本分析器。
   "narrative_context": "a standoff and pursuit sequence"
 }
 """
+
+
+CLOSEUP_LIGHTING_PROMPT = """你是一个专业的影视灯光分析师。
+
+给定一个场景（location）的描述和属性，请分析这个场景的光线特征，并判断在拍摄 close-up（特写镜头）时是否需要显式参考场景图像来保持视觉一致性。
+
+请分析以下维度：
+
+1. **lighting_description**: 简洁描述场景的光线特征（用于注入 close-up prompt）
+   - 包括：光线方向、色温、强度、是否有特殊光源
+   - 示例："warm golden light from large windows, soft ambient lighting"
+
+2. **color_tone**: 场景的主要色调
+   - 示例："warm golden tones", "cool blue tones", "neutral daylight"
+
+3. **complexity_score**: 光线复杂度评分 (1-5)
+   - 1: 简单均匀光（如：明亮的白天室外）
+   - 2: 单一光源（如：正常室内照明）
+   - 3: 中等复杂（如：窗户侧光 + 室内灯）
+   - 4: 复杂光线（如：多色光源、霓虹灯、逆光）
+   - 5: 极复杂（如：赛博朋克场景、舞台灯光）
+
+4. **needs_location_ref**: 是否建议在 close-up 中传入 location 参考图
+   - true: 光线复杂或有特殊色调，纯文字描述难以准确传达
+   - false: 光线简单，文字描述足够
+
+5. **reason**: 简要说明判断理由
+
+输出严格遵循以下 JSON 格式：
+{
+  "lighting_description": "warm ambient lighting with golden tones from large windows and decorative lamps",
+  "color_tone": "warm golden and amber tones",
+  "complexity_score": 3,
+  "needs_location_ref": true,
+  "reason": "The ornate room with gold furniture and large windows creates specific warm reflections that would affect skin tones in close-ups"
+}
+"""
+
+
+@dataclass
+class CloseupLightingAnalysis:
+    """Close-up 镜头的光线分析结果"""
+    lighting_description: str    # 光线描述，用于注入 prompt
+    color_tone: str              # 色调描述
+    complexity_score: int        # 复杂度 1-5
+    needs_location_ref: bool     # 是否需要传 location 参考图
+    reason: str                  # 判断理由
 
 
 class EntityParser:
@@ -227,6 +306,39 @@ class EntityParser:
         data = json.loads(raw_json)
         entities = [Entity(**e) for e in data["entities"]]
 
+        # 解析 entity_counts（用于 Shot 1 验证）
+        entity_counts = []
+        counts_data = data.get("entity_counts", {})
+        if counts_data:
+            # character 数量
+            char_count = counts_data.get("character_count", 0)
+            if char_count > 0:
+                entity_counts.append(EntityCountInfo(
+                    entity_type="character",
+                    expected_count=char_count,
+                    description=counts_data.get("character_description", ""),
+                    is_explicit=counts_data.get("is_count_explicit", False),
+                ))
+            # object 数量
+            obj_count = counts_data.get("object_count", 0)
+            if obj_count > 0:
+                entity_counts.append(EntityCountInfo(
+                    entity_type="object",
+                    expected_count=obj_count,
+                    description="",
+                    is_explicit=False,
+                ))
+        else:
+            # 兼容旧格式：从 entities 列表推断数量
+            char_entities = [e for e in entities if e.type == "character"]
+            if char_entities:
+                entity_counts.append(EntityCountInfo(
+                    entity_type="character",
+                    expected_count=len(char_entities),
+                    description=", ".join(e.entity_id for e in char_entities),
+                    is_explicit=False,
+                ))
+
         # 更新已知实体库（仅新实体加入）
         for entity in entities:
             if entity.is_new:
@@ -242,7 +354,8 @@ class EntityParser:
             raw_text=shot_text,
             entities=entities,
             new_elements=data.get("new_elements", []),
-            style_ref_shot=data.get("style_ref_shot")
+            style_ref_shot=data.get("style_ref_shot"),
+            entity_counts=entity_counts,
         )
 
     def _build_known_context(self) -> str:
@@ -332,6 +445,111 @@ class EntityParser:
 
     def get_known_entities(self) -> List[Entity]:
         return self._known_entities
+
+    def analyze_closeup_lighting(self, location_entities: List[Entity]) -> Optional[CloseupLightingAnalysis]:
+        """
+        分析 close-up 镜头的光线需求（Agentic 决策）
+
+        根据场景 location 的属性，判断：
+        1. 是否需要在 close-up 中传入 location 参考图
+        2. 生成光线描述用于注入 prompt
+
+        Args:
+            location_entities: 当前 shot 的 location 实体列表
+
+        Returns:
+            CloseupLightingAnalysis 或 None（无 location 时）
+        """
+        if not location_entities:
+            return None
+
+        # 收集所有 location 的描述和属性
+        location_info_parts = []
+        for loc in location_entities:
+            source = self._get_entity(loc.entity_id) or loc
+            info = f"Location: {source.text_description}"
+            if source.attributes:
+                attrs = ", ".join(f"{k}={v}" for k, v in source.attributes.items() if v)
+                if attrs:
+                    info += f" (attributes: {attrs})"
+            location_info_parts.append(info)
+
+        location_info = "\n".join(location_info_parts)
+
+        # 同时提供 global context 供 LLM 参考
+        global_info = ""
+        if self._global_context:
+            ctx = self._global_context
+            global_info = f"""
+Global Context:
+- Visual style: {ctx.visual_style}
+- Mood: {ctx.mood}
+- Setting: {ctx.setting}
+"""
+
+        try:
+            user_message = f"""请分析以下场景的光线特征：
+
+{location_info}
+{global_info}
+
+请判断在拍摄 close-up（特写镜头）时，是否需要传入场景参考图来保持光线和色调一致。"""
+
+            raw_json = self.llm.chat(
+                user_message=user_message,
+                system=CLOSEUP_LIGHTING_PROMPT,
+                max_tokens=512,
+            ).strip()
+
+            # 兼容 LLM 输出 ```json ``` 包裹
+            if raw_json.startswith("```"):
+                raw_json = raw_json.split("```")[1]
+                if raw_json.startswith("json"):
+                    raw_json = raw_json[4:]
+                raw_json = raw_json.strip()
+
+            data = json.loads(raw_json)
+            result = CloseupLightingAnalysis(
+                lighting_description=data.get("lighting_description", ""),
+                color_tone=data.get("color_tone", ""),
+                complexity_score=int(data.get("complexity_score", 2)),
+                needs_location_ref=data.get("needs_location_ref", False),
+                reason=data.get("reason", ""),
+            )
+
+            print(f"[Parser] Close-up 光线分析: complexity={result.complexity_score}, "
+                  f"needs_ref={result.needs_location_ref}, reason='{result.reason}'")
+
+            return result
+
+        except Exception as e:
+            print(f"[Parser] Close-up 光线分析失败: {e}，默认不传 location")
+            return CloseupLightingAnalysis(
+                lighting_description="",
+                color_tone="",
+                complexity_score=2,
+                needs_location_ref=False,
+                reason=f"Analysis failed: {e}",
+            )
+
+    def build_closeup_lighting_prompt(self, analysis: CloseupLightingAnalysis) -> str:
+        """
+        根据光线分析结果，构建 close-up 的光线引导 prompt
+
+        Returns:
+            光线引导文本，用于注入生成 prompt
+        """
+        if not analysis or not analysis.lighting_description:
+            return ""
+
+        parts = []
+        parts.append("[Lighting Context for Close-up]")
+        parts.append(f"Lighting: {analysis.lighting_description}.")
+        if analysis.color_tone:
+            parts.append(f"Color tone: {analysis.color_tone}.")
+        parts.append("The background should be softly blurred (shallow depth of field) while maintaining consistent lighting on the subject.")
+
+        return "\n".join(parts)
 
     def save_state(self, path: str):
         """持久化实体图谱"""

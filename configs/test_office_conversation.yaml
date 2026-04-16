@@ -1,0 +1,57 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# test_office_conversation: 双角色 · 6镜头 · 办公室对话场景
+# 测试目标:
+#   Shot 1 → T2V (close-up)，建立金发女性外观（单人近景）
+#   Shot 2 → T2V (close-up)，建立黑人男性外观（新角色首次出现，单人近景）
+#   Shot 3 → Phantom (wide shot)，双人同时出场，验证两个 anchor 能否协同工作
+#   Shot 4-6 → Phantom (close-up)，切回单人近景，验证长序列一致性
+# 难点:
+#   - 两个角色在各自的 close-up 中建立外观，然后在 wide shot 中同时出现
+#   - 频繁的特写/广角切换，需在不同景别下保持角色外观一致
+#   - 测试 Shot 1 验证机制（每个 close-up 应检测到 1 人）
+# ──────────────────────────────────────────────────────────────────────────────
+
+global_caption: >
+  A blonde woman in a black jacket and a bald Black man in a purple shirt are
+  having a conversation across a red and gold desk in an opulent room with gold
+  furniture and large windows. The scene cuts between close-ups of their faces
+  as they talk and a wide shot establishing their positions at the desk.
+
+shots:
+  - shot_id: 1
+    text: >
+      A close-up of a blonde woman with bright red lipstick and gold stud earrings,
+      looking attentively off-camera with a neutral expression in an ornate room setting.
+    duration_seconds: 5.0
+
+  - shot_id: 2
+    text: >
+      A close-up of a bald Black man with a grey goatee, wearing a purple button-down
+      shirt and patterned tie, speaking with a slight smile.
+    duration_seconds: 5.0
+
+  - shot_id: 3
+    text: >
+      A wide shot showing the woman and man seated facing each other at an ornate,
+      gold-trimmed red desk. The woman has an open laptop and documents in front of her,
+      while the man sits opposite her. Behind them is a gold, tufted sofa and two large
+      windows with lit lamps on either side.
+    duration_seconds: 5.0
+
+  - shot_id: 4
+    text: >
+      A close-up returns to the man, who is looking towards the woman (off-camera)
+      with a soft, slightly amused expression.
+    duration_seconds: 5.0
+
+  - shot_id: 5
+    text: >
+      A close-up of the woman, her brow slightly furrowed and mouth slightly open,
+      appearing concerned or surprised by the ongoing conversation.
+    duration_seconds: 5.0
+
+  - shot_id: 6
+    text: >
+      A close-up of the man speaking again, his expression more serious as he
+      continues the discussion.
+    duration_seconds: 5.0
