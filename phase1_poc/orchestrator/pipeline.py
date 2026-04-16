@@ -215,20 +215,22 @@ class T2VGroundingPipeline:
                 key=lambda e: priority_order.get(e.grounding_priority, 2)
             )
 
-            # 根据镜头类型决定参考图数量：
-            # - close-up: 只传主角（第一个 high priority character），不传 location
-            # - wide shot: 传所有角色 + location
-            # - 其他: 最多 2 个角色 + location
+            # 根据镜头类型决定是否传 location 参考图：
+            # - close-up: 不传 location（背景虚化/模糊，突出主体）
+            #             角色数量由实际解析结果决定（可能是多人 close-up）
+            # - wide/medium: 传 location 保持场景一致性
+            # 注意：Phantom 最多支持 4 张参考图
             if is_closeup:
-                max_non_loc_refs = 1  # close-up 只传主角
                 include_location = False
-                print(f"[Pipeline] 检测到 close-up 镜头，只使用主角参考图")
+                # close-up 不传 location，所以角色可以用满 4 张
+                max_non_loc_refs = 4
+                print(f"[Pipeline] 检测到 close-up 镜头，不使用 location 参考图")
             elif is_wide:
+                include_location = True
                 max_non_loc_refs = 3 if location_entities else 4
-                include_location = True
             else:
-                max_non_loc_refs = 2 if location_entities else 3  # 减少角色参考图
                 include_location = True
+                max_non_loc_refs = 3 if location_entities else 4
 
             # ── 关键改动：使用锚点策略，防止误差累积 ──────────────────────────
             # 对于 character，优先使用最早出现的高质量参考图（锚点）

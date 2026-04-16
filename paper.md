@@ -108,21 +108,21 @@ To address this, we introduce an \textbf{anchor strategy} for character entities
 
 where \texttt{query\_anchor} returns the entry with minimum \texttt{shot\_id} among all entries with quality $\geq \tau_q$.
 
-\textbf{Shot-Type Adaptive Reference Selection.} We observe that the optimal number of reference images depends on the shot type. A close-up focusing on a single character should not receive multiple character references, as this confuses the generation model's composition decisions. We automatically detect shot types via keyword matching and adapt reference selection accordingly:
+\textbf{Shot-Type Adaptive Reference Selection.} We observe that the optimal reference set depends on the shot type. Specifically, close-up shots benefit from \emph{not} including location references, as this allows the background to naturally blur or defocus, emphasizing the subject. We automatically detect shot types via keyword matching and adapt reference selection accordingly:
 
 \begin{center}
-\begin{tabular}{lccc}
+\begin{tabular}{lcc}
 \toprule
-\textbf{Shot Type} & \textbf{Keywords} & \textbf{Max Char Refs} & \textbf{Include Location} \\
+\textbf{Shot Type} & \textbf{Keywords} & \textbf{Include Location} \\
 \midrule
-Close-up & ``close-up'', ``tight shot'' & 1 & No \\
-Wide shot & ``wide shot'', ``establishing'' & 3 & Yes \\
-Medium (default) & -- & 2 & Yes \\
+Close-up & ``close-up'', ``tight shot'' & No \\
+Wide shot & ``wide shot'', ``establishing'' & Yes \\
+Medium (default) & -- & Yes \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-For close-up shots, omitting the location reference allows the background to naturally blur/defocus, emphasizing the subject.
+Note that close-up shots may still feature multiple characters (e.g., ``a close-up on a man and a woman''), so the number of character references is determined by the actual entities parsed from the shot description, not hard-coded. When location is excluded, all 4 reference slots (the S2V model's maximum) can be used for character/object references.
 
 \textbf{Per-Shot Seed Increment.} To increase generation diversity across shots (avoiding the tendency for similar prompts with similar references to produce nearly identical outputs), we use an incremented seed for each shot: $\text{seed}_n = \text{seed}_{\text{base}} + n$.
 

@@ -71,24 +71,27 @@ Pipeline 在正式处理镜头前，会：
 
 **镜头类型自适应参考图筛选**：
 
-Pipeline 会自动检测镜头类型（通过关键词匹配），并据此决定传入多少参考图：
+Pipeline 会自动检测镜头类型（通过关键词匹配），决定是否传入 location 参考图：
 
-| 镜头类型 | 关键词 | 角色参考图 | Location |
-|----------|--------|-----------|----------|
-| close-up | "close-up", "tight shot", "focuses on" | 只传 1 个主角 | **不传** |
-| wide shot | "wide shot", "wide angle", "establishing" | 最多 3 个 | 传 |
-| 其他（中景） | - | 最多 2 个 | 传 |
+| 镜头类型 | 关键词 | Location 参考图 | 说明 |
+|----------|--------|----------------|------|
+| close-up | "close-up", "tight shot", "focuses on" | **不传** | 背景虚化/模糊，突出主体 |
+| wide shot | "wide shot", "wide angle", "establishing" | 传 | 场景一致性 |
+| 其他（中景） | - | 传 | 场景一致性 |
 
-**设计原理**：close-up 镜头聚焦单一角色，传入过多参考图会让模型难以决定构图；不传 location 参考图让背景虚化/模糊，突出主体。
+**设计原理**：
+- close-up 镜头聚焦主体，背景通常虚化，不传 location 让模型自由生成背景
+- close-up 可能包含多人（如 "a close-up on a man and a woman"），角色数量由实际解析结果决定
+- Phantom 最多支持 4 张参考图，close-up 不传 location 时角色可用满 4 张
 
 ```
 ┌────────────────────────────────────────────────────────────┐
 │ Step 1: 分离 location 和非 location 实体                    │
 │                                                            │
 │ Step 2: 检测镜头类型（close-up / wide / medium）            │
-│   close-up → max_refs=1, 不传 location                     │
-│   wide     → max_refs=3, 传 location                       │
-│   medium   → max_refs=2, 传 location                       │
+│   close-up → 不传 location，角色最多 4 个                   │
+│   wide     → 传 location，角色最多 3 个                     │
+│   medium   → 传 location，角色最多 3 个                     │
 │                                                            │
 │ Step 3: 处理非 location 实体（使用锚点策略）                │
 │   对于 character 类型：                                     │
