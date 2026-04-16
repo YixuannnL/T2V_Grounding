@@ -55,10 +55,10 @@ generator:
   phantom_task:  "s2v-14B"   # s2v-1.3B | s2v-14B
 
   # 多卡配置（torchrun --nproc_per_node=N 启动时生效）
-  # use_usp:  序列并行，配合 xfuser 初始化（已在 ref2video.py 中自动处理）
+  # use_usp:  序列并行，配合 xfuser 初始化（需要 FlashAttention 2.7+）
   # dit_fsdp: DiT 权重分片，14B 多卡必须开启，否则每卡需独立存完整 FP32 模型(~56GB)
   # t5_fsdp:  T5 权重分片，同理
-  use_usp:   true    # USP(Ulysses序列并行): 8卡切分sequence，attention计算8x加速
+  use_usp:   false
   dit_fsdp:  true
   t5_fsdp:   true
 

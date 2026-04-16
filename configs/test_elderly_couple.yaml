@@ -1,0 +1,53 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# test_elderly_couple: 双角色 + 孩子 · 6镜头 · 客厅对话场景
+# 测试目标: Shot 1 T2V 建立老年夫妇+男孩外观，后续镜头保持三人一致性
+# 难点: 广角→特写→广角频繁切换，需在不同景别下保持角色外观一致
+# ──────────────────────────────────────────────────────────────────────────────
+
+global_caption: >
+  An elderly couple stands in a brightly lit living room, engaged in a serious
+  conversation while a young boy listens intently. The scene alternates between
+  wide shots of the three figures and close-ups of the man and woman as they
+  speak to one another.
+
+shots:
+  - shot_id: 1
+    text: >
+      A wide shot shows an elderly man in a suit and an older woman in a floral
+      cardigan standing side-by-side in a living room, looking toward a young boy
+      who stands facing them. The room is brightly lit with warm ambient lighting.
+    duration_seconds: 5.0
+
+  - shot_id: 2
+    text: >
+      A close-up of the elderly man, wearing glasses and a dark suit, as he speaks
+      with a concerned expression. His face shows deep wrinkles and gray hair.
+    duration_seconds: 5.0
+
+  - shot_id: 3
+    text: >
+      A close-up of the woman, with her silver hair neatly styled, looking at the
+      man with a serious and attentive look. She wears a floral cardigan over a
+      light blouse.
+    duration_seconds: 5.0
+
+  - shot_id: 4
+    text: >
+      The camera cuts back to the elderly couple standing together in the living room,
+      looking at each other while they talk. The man in the dark suit and the woman
+      in the floral cardigan exchange meaningful glances.
+    duration_seconds: 5.0
+
+  - shot_id: 5
+    text: >
+      A medium wide shot shows the elderly couple and the young boy, capturing the
+      spatial arrangement of the room and the focus of the three individuals.
+      The boy watches the adults with an intent expression.
+    duration_seconds: 5.0
+
+  - shot_id: 6
+    text: >
+      A close-up shot focuses again on the elderly man and woman as they continue
+      their discussion, highlighting the tension and gravity in their exchange.
+      Both faces are framed tightly, showing their emotional expressions.
+    duration_seconds: 5.0

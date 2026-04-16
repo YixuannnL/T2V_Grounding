@@ -12,55 +12,397 @@
 
 ## 核心流程详解
 
-整个 pipeline 按镜头顺序执行，每个镜头分为"生成"和"入库"两个阶段。
+整个 Pipeline 按镜头顺序执行，每个镜头经历 **解析 → 路由 → 生成 → Grounding → 入库** 五个阶段。
 
-### 阶段一：实体解析（每个镜头执行一次）
+### 阶段一：LLM 实体解析
+
+**文件**：`entity_parser/parser.py`
 
 用 LLM（Claude）读取当前镜头的文字描述，从中识别出所有需要跨镜头保持一致的"实体"：
 
-- **人物**（character）：如"留胡子的男人"、"戴白色面具的人"
-- **重要物体**（object）：如"狙击步枪"、"皮质日记本"
-- **场景**（location）：如"沙漠废墟"、"私人书房"
+| 实体类型 | 示例 | Grounding 优先级 |
+|---------|------|-----------------|
+| `character` | "留胡子的男人"、"戴白色面具的人" | high |
+| `object` | "狙击步枪"、"皮质日记本" | medium |
+| `location` | "沙漠废墟"、"私人书房" | medium |
+| `style` | "赛博朋克风格" | low |
 
-每个实体被分配一个唯一 ID（如 `char_bearded_man`），并记录外观属性。这些 ID 在所有镜头中保持一致，是后续"认人"的关键。
+**每个实体的数据结构**：
+```python
+@dataclass
+class Entity:
+    entity_id: str            # 跨镜头唯一 ID，如 "char_bearded_man"
+    type: str                 # character / object / location / style
+    text_description: str     # 原文描述
+    attributes: dict          # {"gender": "male", "age": "40s", "weapon": "sniper rifle"}
+    is_new: bool              # 是否首次出现
+    grounding_priority: str   # high / medium / low
+    aliases: List[str]        # 别名列表 ["the man", "he", "the armed man"]
+```
 
-> **跨镜头共指消解**：Shot 1 写了"一个留胡子的男人拿着狙击枪"，Shot 2 写了"这名男子向前跑去"——LLM 会把"这名男子"识别为同一个 `char_bearded_man`，而不是创建新实体。
+**跨镜头共指消解**：
+- Shot 1 写了 "a bearded man with a sniper rifle"
+- Shot 2 写了 "the armed man runs forward"
+- LLM 会把 "the armed man" 识别为同一个 `char_bearded_man`，而不是创建新实体
 
-### 阶段二：路由决策（决定用哪个模型生成）
+**global_caption 预解析**（推荐）：
+```yaml
+global_caption: >
+  The video depicts a tense scene where a bearded man armed with
+  a sniper rifle pursues a mysterious masked figure in black.
+```
+Pipeline 在正式处理镜头前，会：
+1. 用 `shot_id=0` 解析 global_caption，提取所有实体建立"实体图谱"
+2. 调用 `_extract_global_context()` 提取全局语义（风格、氛围、叙事背景）
 
-查询"参考图库"（Entity Registry）——一个 SQLite 数据库，存储着历史镜头中每个实体的截图：
+后续每个 shot 解析时参照实体图谱做共指消解，生成 prompt 时注入全局语义上下文。
 
-- **库里没有这个角色的图** → 用 **WanT2V**（纯文字→视频）生成。这发生在首个镜头，或角色第一次出现时。
-- **库里已有这个角色的图** → 用 **Phantom S2V**（图+文字→视频）生成。把截图作为外观参考传给模型。
+### 阶段二：路由决策
 
-> **为什么不用图转视频（I2V）？** I2V 模型把参考图当成视频第 0 帧，会直接锁死构图、背景、姿态——角色只能静止不动。Phantom S2V 不同，它只从参考图中提取外观特征（脸型、发色、服装），姿态和动作完全由文字描述决定，更灵活。
+**文件**：`orchestrator/pipeline.py`
 
-### 阶段三：视频生成
+查询 **Entity Registry**（SQLite 数据库），判断当前镜头中的实体是否已有历史参考图。
 
-把组装好的 prompt（= 全局背景描述 + 当前镜头描述）和参考图送给模型，生成当前镜头的视频（默认 81 帧，约 3.4 秒，分辨率 832×480）。
+**实体分类处理**：
+- **非 location 实体**（character, object）：按 high → medium 优先级排序，最多取 3 个
+- **location 实体**：单独处理，确保场景一致性
+  - 如果 registry 中已有该 location 的参考图 → **必须使用**（非新场景）
+  - 如果 registry 中无记录 → 新场景，生成后会自动 grounding 入库
 
-多卡环境下（4 张 A100），所有 GPU 共同参与推理（Phantom 14B 模型的参数分布在 4 张卡上），速度约为单卡的 3 倍。
+**镜头类型自适应参考图筛选**：
 
-### 阶段四：视觉 Grounding（生成之后才做）
+Pipeline 会自动检测镜头类型（通过关键词匹配），并据此决定传入多少参考图：
 
-生成完视频后，对这个视频做"角色定位"，把截图存入库中供下一个镜头使用：
+| 镜头类型 | 关键词 | 角色参考图 | Location |
+|----------|--------|-----------|----------|
+| close-up | "close-up", "tight shot", "focuses on" | 只传 1 个主角 | **不传** |
+| wide shot | "wide shot", "wide angle", "establishing" | 最多 3 个 | 传 |
+| 其他（中景） | - | 最多 2 个 | 传 |
 
-**Step 1 — 抽帧**：按 1fps 从视频中提取若干帧（如 4 帧）
+**设计原理**：close-up 镜头聚焦单一角色，传入过多参考图会让模型难以决定构图；不传 location 参考图让背景虚化/模糊，突出主体。
 
-**Step 2 — Grounding DINO 检测**：用开放词汇目标检测模型，根据实体的文字描述（如 "bearded man with sniper rifle"）在每一帧中画出边界框，定位角色位置
+```
+┌────────────────────────────────────────────────────────────┐
+│ Step 1: 分离 location 和非 location 实体                    │
+│                                                            │
+│ Step 2: 检测镜头类型（close-up / wide / medium）            │
+│   close-up → max_refs=1, 不传 location                     │
+│   wide     → max_refs=3, 传 location                       │
+│   medium   → max_refs=2, 传 location                       │
+│                                                            │
+│ Step 3: 处理非 location 实体（使用锚点策略）                │
+│   对于 character 类型：                                     │
+│     Registry.query_anchor(entity_id, min_quality=0.4)     │
+│     【锚点策略】优先最早出现的高质量参考图，防止误差累积    │
+│                                                            │
+│ Step 4: 处理 location 实体（场景一致性）                    │
+│   Registry.query(loc_entity_id, anchor_strategy="earliest")│
+│     有参考图 → 必须使用（保证场景一致性）                   │
+│     无参考图 → 新场景，跳过                                 │
+└────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+        ┌─────────────────────────────────────────┐
+        │ reference_used 列表有图？                │
+        │                                         │
+        │   YES ──▶ generation_mode = "phantom"   │
+        │           使用 Phantom S2V（参考图+文本）│
+        │                                         │
+        │   NO  ──▶ generation_mode = "t2v"       │
+        │           使用 WanT2V（纯文本生成）      │
+        └─────────────────────────────────────────┘
+```
 
-**Step 3 — SAM2 分割**：对检测到的边界框做精细的像素级分割，裁切出干净的角色图像
+**锚点策略（防止误差累积）**：
 
-**Step 4 — Re-ID 质量评分**：对所有裁切图打分，过滤掉质量差的：
-- **清晰度**：Laplacian 方差（模糊的图扣分）
-- **人脸置信度**：InsightFace 检测人脸（人物类实体，找不到人脸则得 0 分）
-- **bbox 面积**：如果裁切框太小（短边 < 80px），说明检测到的是远景小人，pad 到 832×480 后主体面积不足 1%，传给模型没有意义，给低分过滤掉
+这是本系统的核心设计之一。观察发现：越往后的 shot，生成的人脸越可能偏离原始外观。如果每次都用最近 shot 的 grounding 结果作为参考图，误差会逐步累积。
 
-**Step 5 — 参考图预处理**：将筛选出的高质量截图 resize+白边 padding 到 832×480，保证所有参考图经 VAE 编码后维度一致（否则多张图 `torch.cat` 时会报维度不匹配）
+**解决方案**：对于 character 类型实体，始终使用该实体**最早出现且质量达标**的参考图（锚点），而非最近 shot 的结果。
 
-**Step 6 — 入库**：写入 Entity Registry，供下一个镜头的 Phantom S2V 使用
+```python
+# 旧逻辑（误差累积）
+refs = registry.query(entity_id, top_k=1)  # 返回最近 shot 的结果
 
-### 完整流程图
+# 新逻辑（锚点策略）
+anchor = registry.query_anchor(entity_id, min_quality=0.5)  # 返回最早的高质量参考
+# 日志：使用锚点参考图 (shot=1, score=0.88)
+```
+
+**路由逻辑要点**：
+- Shot 1 必定走 `t2v`（首镜头，Registry 为空）
+- Shot 2+ 若历史有参考图则走 `phantom`
+- 新角色首次出现也走 `t2v`，生成后入库，下一镜头就有参考了
+- **每个 shot 使用递增的 seed**（`base_seed + shot_id`），增加生成多样性
+
+### 阶段三：三层 Prompt 构建
+
+**文件**：`orchestrator/pipeline.py` 第 217-243 行，`entity_parser/parser.py`
+
+生成 prompt 时**不直接使用 global_caption 原文**（因为它包含整个故事的叙事，会把后续镜头的角色注入当前镜头），而是分三层精细构建：
+
+#### Layer 1: Global Context（全局语义上下文）
+
+由 `build_global_context_prompt()` 从 `global_caption` 中提取，包含风格、氛围、叙事背景等**跨越所有镜头的共性信息**，不包含具体角色/物体描述：
+
+```python
+def build_global_context_prompt() -> str:
+    """
+    输出格式：
+    [Global Context]
+    Visual style: cinematic, dramatic lighting.
+    Mood: tense, suspenseful.
+    Setting: sandy desolate desert environment.
+    Narrative: a standoff and pursuit sequence.
+    """
+```
+
+#### Layer 2: Shot Context（当前镜头实体描述）
+
+由 `build_shot_context()` 构建，**只包含本 shot 实际出现的实体**，从实体图谱中查找完整属性：
+
+```python
+def build_shot_context(parse_result) -> str:
+    """
+    输出格式：
+    [Shot Entities]
+    Character: bearded man (gender: male, age: 40s, weapon: sniper rifle).
+    Scene: sandy desolate environment (lighting: harsh sunlight).
+    """
+```
+
+#### Layer 3: Shot Text（原始镜头描述）
+
+直接使用 config 中的镜头文本描述：
+
+```
+A close-up shot shows the bearded man looking through the scope of his rifle.
+```
+
+#### 最终 Prompt 组装
+
+```python
+prompt_parts = []
+prompt_parts.append(global_context)      # Layer 1
+prompt_parts.append(shot_context)        # Layer 2
+prompt_parts.append(shot.text)           # Layer 3
+gen_prompt = "\n\n".join(prompt_parts)
+```
+
+**实际输出示例（Shot 1）**：
+```
+[Global Context]
+Visual style: cinematic, dramatic lighting.
+Mood: tense, suspenseful.
+Setting: sandy desolate desert environment.
+Narrative: a standoff and pursuit sequence.
+
+[Shot Entities]
+Character: bearded man (gender: male, age: 40s, weapon: sniper rifle).
+Object: sniper rifle.
+Scene: sandy desert background.
+
+A close-up shot shows a bearded man intently looking through the scope
+of a large sniper rifle, with a distorted "STOP" sign and sandy
+background visible.
+```
+
+**Prompt Debug 功能**：每个 shot 生成的最终 prompt 会保存到 `output/prompts/shot_XXX_prompt.txt`，方便调试和分析。
+
+### 阶段四：视频生成
+
+**文件**：`generator/ref2video.py`
+
+#### 4.1 WanT2V（纯文本生成）
+
+当 `generation_mode = "t2v"` 时调用，用于：
+- 首个镜头（Registry 为空）
+- 新角色首次出现
+
+```python
+def _phantom_t2v_generate(self, prompt, output_path):
+    frames = self._t2v_pipeline.generate(
+        input_prompt=prompt,
+        size=(832, 480),
+        frame_num=81,           # 81帧 ≈ 3.4秒 @24fps
+        sampling_steps=50,
+        guide_scale=7.5,        # 文本对齐强度
+    )
+```
+
+#### 4.2 Phantom S2V（参考图+文本生成）
+
+当 `generation_mode = "phantom"` 且有参考图时调用。
+
+**关键特性**：Phantom 只从参考图提取**外观特征**（脸型、发色、服装），**姿态和动作由文本决定**，不会像 I2V 模型那样锁定第一帧构图。
+
+```python
+def _phantom_s2v_generate(self, prompt, references, output_path):
+    # 参考图预处理：resize + 白边 padding → 832×480
+    ref_imgs = [self._preprocess_ref_image(img, 832, 480)
+                for img in references[:4]]  # 最多 4 张
+
+    frames = self._pipeline.generate(
+        input_prompt=prompt,
+        ref_images=ref_imgs,
+        guide_scale_img=5.0,    # 参考图外观强度
+        guide_scale_text=7.5,   # 文本对齐强度
+    )
+```
+
+**参考图预处理**（与 Phantom 官方一致）：
+```
+原图 (任意尺寸)
+    │
+    ▼ 保持宽高比 resize
+    │
+    ▼ 白色填充到 832×480
+    │
+    ▼ VAE encode → latent concat 到生成序列
+```
+
+#### 4.3 多卡并行配置
+
+| 配置项 | 说明 |
+|-------|------|
+| `use_usp=true` | USP 序列并行（需要 FlashAttention）|
+| `dit_fsdp=true` | DiT 模型参数分片到多卡 |
+| `t5_fsdp=true` | T5 文本编码器参数分片 |
+
+**8 卡 H800 + USP** 可达 **16 FPS**，比纯 FSDP 快 2-3 倍。
+
+### 阶段五：Visual Grounding（生成后执行）
+
+**文件**：`visual_grounding/grounder.py`
+
+生成完视频后，对视频做"角色定位"，把高质量截图存入 Registry 供下一个镜头使用。
+
+#### Step 1：抽帧
+
+```python
+def extract_frames(video_path, output_dir, fps=1.0):
+    """按指定 fps 从视频中均匀采帧"""
+    # 81帧视频 @24fps ≈ 3.4秒
+    # fps=1.0 → 提取约 3-4 帧
+```
+
+#### Step 2：Grounding DINO 检测
+
+开放词汇目标检测，根据实体的 `text_description` 定位边界框：
+
+```python
+boxes, logits, phrases = predict(
+    model=self._gdino_model,
+    image=image_tensor,
+    caption="bearded man with sniper rifle",  # entity.text_description
+    box_threshold=0.35,
+    text_threshold=0.25,
+)
+# 返回：边界框坐标 + 置信度分数
+```
+
+#### Step 3：SAM2 精细分割
+
+对检测到的边界框做像素级分割，提取干净的前景：
+
+```python
+def _extract_with_sam2(self, image_rgb, bbox):
+    self._sam2_predictor.set_image(image_rgb)
+    masks, scores, _ = self._sam2_predictor.predict(
+        box=np.array([[x1, y1, x2, y2]]),
+        multimask_output=False,
+    )
+    # 前景保留，背景填白
+    result = image_rgb.copy()
+    result[mask == 0] = 255
+    return result[y1:y2, x1:x2]
+```
+
+**Location 类型特殊处理**：
+```python
+if entity_type == "location":
+    # 检测所有前景 → SAM2 得到 union mask → cv2.inpaint 填充
+    # 返回干净的背景帧作为场景参考
+    bg_img = self._extract_background(image_source, image_tensor)
+```
+
+#### Step 4：Re-ID 质量评分
+
+**文件**：`visual_grounding/reid.py`
+
+对所有裁切图打分，过滤低质量截图：
+
+```python
+@dataclass
+class QualityScore:
+    sharpness: float       # Laplacian 方差，越高越清晰
+    id_confidence: float   # InsightFace 人脸检测置信度
+    frontal_score: float   # 正面程度（yaw 角接近 0 则高）
+    final_score: float     # 加权综合分
+
+# 综合分计算
+final = 0.4 * sharpness + 0.4 * id_confidence + 0.2 * frontal_score
+```
+
+**评分维度详解**：
+
+| 维度 | 计算方式 | 作用 |
+|-----|---------|------|
+| 清晰度 | `cv2.Laplacian(gray).var() / 500` | 过滤模糊帧 |
+| 人脸置信度 | InsightFace `det_score` | 确保人脸可辨识 |
+| 正面程度 | `1 - abs(yaw) / 90` | 优先选正脸 |
+| bbox 面积 | 检测框占图像比例 | 过滤太小的远景人物 |
+
+**过滤阈值**：`min_ref_quality=0.4`，低于此分数的截图不入库。
+
+#### Step 4.5：跨实体 IoU 去重（多人场景）
+
+**问题**：当一帧中有多人时，Grounding DINO 可能把 "young boy" 的检测框错误地定位到 "elderly man" 上（因为都是 person 类别）。
+
+**解决方案**：对同一帧中所有实体的检测结果做 IoU 去重：
+
+```python
+def _cross_entity_dedup(all_ground_results, iou_threshold=0.5):
+    """
+    跨实体 IoU 去重：同一帧中，如果多个实体的检测框高度重叠，
+    只保留置信度最高的那个实体的检测结果。
+    """
+    # 按帧分组所有检测结果
+    # 对每帧：按置信度排序 → 高置信度的抑制重叠的低置信度检测
+```
+
+**效果**：
+```
+[Pipeline] IoU去重: char_young_boy 的检测被 char_elderly_man 抑制 (IoU=0.78, frame=frame_000024.jpg)
+[Pipeline] 跨实体IoU去重: 共移除 3 个重叠检测
+```
+
+#### Step 5：入库
+
+**文件**：`reference_manager/registry.py`
+
+```python
+@dataclass
+class ReferenceEntry:
+    entity_id: str        # "char_bearded_man"
+    shot_id: int          # 来自哪个镜头
+    crop_path: str        # 裁切图路径
+    quality_score: float  # 综合质量分
+    source: str           # "grounding" | "bootstrapped" | "manual"
+```
+
+```python
+registry.register(entity_id, ReferenceEntry(
+    entity_id="char_bearded_man",
+    shot_id=1,
+    crop_path="crops/shot_001/char_bearded_man_frame_000024_det00_crop.jpg",
+    quality_score=0.72,
+    source="grounding",
+))
+```
+
+---
+
+## 完整流程图
 
 ```
 输入脚本 (YAML)
@@ -68,40 +410,72 @@
   ├─ [可选] global_caption
   │     │
   │     └─► LLM 解析 (Shot 0)
-  │           提取所有实体，写入已知实体列表
-  │           例：char_bearded_man、char_masked_figure、loc_desert
+  │           ├─ 提取所有实体，建立实体图谱
+  │           └─ 例：char_bearded_man、char_masked_figure、loc_desert
   │
   ├─ Shot 1 描述文本
   │     │
-  │     ├─► LLM 解析：提取实体，查已知列表做共指消解
-  │     │     → {char_bearded_man: 首次出现}
+  │     ├─► [1] LLM 解析
+  │     │     ├─ 提取实体，查已知列表做共指消解
+  │     │     └─ → {char_bearded_man: 首次出现, is_new=true}
   │     │
-  │     ├─► Registry 查询：char_bearded_man 无参考图
-  │     │     → 路由：WanT2V（纯文本生成）
+  │     ├─► [2] Registry 查询
+  │     │     ├─ char_bearded_man 无参考图
+  │     │     └─ → 路由：WanT2V（纯文本生成）
   │     │
-  │     ├─► WanT2V 生成 → shot_001.mp4
+  │     ├─► [3] Prompt 构建
+  │     │     └─ gen_prompt = shot_context + shot.text
   │     │
-  │     └─► Post-Grounding（生成后）
-  │           抽帧 → DINO 检测 → SAM2 分割 → 质量评分 → 预处理
-  │           → Registry 入库：char_bearded_man: [crop_A, crop_B, crop_C]
+  │     ├─► [4] WanT2V 生成 → shot_001.mp4
+  │     │
+  │     └─► [5] Post-Grounding
+  │           ├─ 抽帧 (1fps) → 3-4 帧
+  │           ├─ Grounding DINO 检测 → 边界框
+  │           ├─ SAM2 分割 → 白底前景图
+  │           ├─ Re-ID 评分 → 过滤低质量
+  │           └─ Registry 入库：char_bearded_man: [crop_A, crop_B]
   │
   ├─ Shot 2 描述文本
   │     │
-  │     ├─► LLM 解析："the armed man" → char_bearded_man（共指消解成功）
+  │     ├─► [1] LLM 解析
+  │     │     └─ "the armed man" → char_bearded_man（共指消解）
   │     │
-  │     ├─► Registry 查询：char_bearded_man 有 3 张参考图
-  │     │     → 路由：Phantom S2V（参考图 + 文本生成）
+  │     ├─► [2] Registry 查询
+  │     │     ├─ char_bearded_man 有 2 张参考图
+  │     │     └─ → 路由：Phantom S2V
   │     │
-  │     ├─► 参考图预处理：resize+pad → 832×480
+  │     ├─► [3] 参考图预处理
+  │     │     └─ resize + 白边 padding → 832×480
   │     │
-  │     ├─► Phantom S2V 生成（参考图提供外观，文本决定动作）→ shot_002.mp4
+  │     ├─► [4] Phantom S2V 生成
+  │     │     ├─ 参考图提供外观
+  │     │     ├─ 文本决定动作
+  │     │     └─ → shot_002.mp4
   │     │
-  │     └─► Post-Grounding → 更新 Registry
+  │     └─► [5] Post-Grounding → 更新 Registry
   │
   └─ Shot N ... （同上，Registry 滚动积累）
 
-输出：output/videos/shot_001.mp4, shot_002.mp4, ..., pipeline_report.json
+输出：
+  output/
+  ├── videos/shot_001.mp4, shot_002.mp4, ...
+  ├── prompts/shot_001_prompt.txt, ...    # 每个 shot 的最终生成 prompt（含 seed、镜头类型）
+  ├── frames/shot_001/, shot_002/, ...      # 抽帧结果
+  ├── crops/shot_001/, shot_002/, ...       # Grounding 裁切图
+  ├── selected_refs/{entity_id}/            # Grounding 后入库的所有达标参考图（候选池）
+  ├── used_refs/shot_001/, shot_002/, ...   # 【新增】每个 shot 实际输入模型的参考图
+  ├── registry/entities.db                  # SQLite 参考图数据库
+  └── pipeline_report.json                  # 详细运行报告（含每 shot 的 gen_prompt）
 ```
+
+**`selected_refs/` vs `used_refs/` 目录区别**：
+
+| 目录 | 内容 | 用途 |
+|------|------|------|
+| `selected_refs/{entity_id}/` | 每个 shot grounding 后**所有达标的候选图** | 累积的参考池 |
+| `used_refs/shot_XXX/` | 该 shot **实际输入模型的参考图** | 明确知道选了哪张 |
+
+`used_refs/` 目录文件命名格式：`{entity_id}_{idx}.jpg`，一目了然。
 
 ---
 
@@ -121,12 +495,12 @@
 
 | 组件 | 文件 | 职责 |
 |------|------|------|
-| LLM 实体解析器 | `entity_parser/parser.py` | 调用 Claude 从文本提取实体，跨镜头共指消解，支持 global_caption 预解析 |
+| LLM 实体解析器 | `entity_parser/parser.py` | 调用 Claude 从文本提取实体，跨镜头共指消解，global_caption 预解析，三层 prompt 构建 |
 | 参考图库 | `reference_manager/registry.py` | SQLite 数据库，存储每个实体的参考截图路径和质量分 |
 | 视觉 Grounding | `visual_grounding/grounder.py` | Grounding DINO 检测 + SAM2 分割，从生成视频中定位并裁切实体 |
-| 质量评分 | `visual_grounding/reid.py` | 对裁切图打分（清晰度、人脸置信度、bbox 面积），过滤低质量截图 |
-| 视频生成器 | `generator/ref2video.py` | 封装 WanT2V 和 Phantom S2V，含参考图预处理和多卡 rank 守卫 |
-| 主 Pipeline | `orchestrator/pipeline.py` | 串联以上所有组件，管理多卡分布式逻辑（rank 0 负责解析和入库，所有 rank 参与推理）|
+| 质量评分 | `visual_grounding/reid.py` | 对裁切图打分（清晰度、人脸置信度、正面程度、bbox 面积），过滤低质量截图 |
+| 视频生成器 | `generator/ref2video.py` | 封装 WanT2V 和 Phantom S2V，含参考图预处理、T2V/S2V 动态切换、VRAM 管理、多卡支持 |
+| 主 Pipeline | `orchestrator/pipeline.py` | 串联以上所有组件，三层 prompt 构建，prompt 保存，多卡分布式逻辑 |
 | LLM 客户端 | `utils/llm_client.py` | 封装公司内部 OpenAI 兼容 API，含模型别名映射和限流重试 |
 
 ---
@@ -136,34 +510,32 @@
 ```
 T2V_Grounding/
 ├── README.md                        # 本文档
-├── ROADMAP.md                       # 三阶段路线图
 ├── configs/
 │   ├── config.yaml                  # 全局配置（模型路径、API key、多卡参数等）
 │   ├── demo_script.yaml             # 测试脚本01：单角色 4 镜头
-│   ├── test_aba_scene.yaml          # 测试脚本02：A→B→A 场景回归（3 镜头）
+│   ├── test_aba_scene.yaml          # 测试脚本02：A→B→A 场景回归
 │   ├── test_sniper_standoff.yaml    # 测试脚本03：global_caption + 5 镜头
-│   └── test_dual_character.yaml     # 测试脚本04：双角色 5 镜头
-├── scripts/
-│   └── run_multi_seed.sh            # 多 seed 批量生成脚本
+│   ├── test_dual_character.yaml     # 测试脚本04：双角色 5 镜头
+│   └── test_scene_consistency.yaml  # 测试脚本05：场景一致性
 ├── phase1_poc/
 │   ├── run_demo.py                  # 主入口（单卡/多卡通用）
 │   ├── entity_parser/
-│   │   └── parser.py                # LLM 实体提取 + 跨镜头共指消解
+│   │   └── parser.py                # LLM 实体提取 + 共指消解 + 全局语义提取
 │   ├── visual_grounding/
 │   │   ├── grounder.py              # Grounding DINO + SAM2
-│   │   └── reid.py                  # Re-ID 质量打分（含 bbox 面积惩罚）
+│   │   └── reid.py                  # Re-ID 质量打分
 │   ├── reference_manager/
 │   │   └── registry.py              # Entity Registry（SQLite）
 │   ├── generator/
-│   │   └── ref2video.py             # WanT2V / Phantom S2V 封装 + 路由
+│   │   └── ref2video.py             # WanT2V / Phantom S2V 封装
 │   ├── orchestrator/
-│   │   └── pipeline.py              # 主 Pipeline（支持多卡分布式）
+│   │   └── pipeline.py              # 主 Pipeline + 三层 Prompt 构建
 │   ├── utils/
-│   │   └── llm_client.py            # 公司内部 API 统一封装
-│   └── weights/                     # Grounding DINO / SAM2 / BERT 权重
+│   │   └── llm_client.py            # LLM API 封装
+│   └── weights/                     # 模型权重
 │       ├── groundingdino_swinb_cogcoor.pth
 │       ├── GroundingDINO_SwinB_cfg.py
-│       ├── bert-based-uncased/      # Grounding DINO 文本编码器
+│       ├── bert-based-uncased/
 │       └── sam2_hiera_large.pt
 ├── phase2_system/
 │   └── agent_orchestrator.py        # Agentic Loop（Phase 2，开发中）
@@ -174,76 +546,9 @@ T2V_Grounding/
 
 ---
 
-## 输入脚本格式
+## 快速开始
 
-### 基础格式
-
-每个 shot 写一段文字描述这个镜头发生了什么。**第 1 个镜头应完整描述角色外观**（发色、服装等），后续镜头可以用简短指代。
-
-```yaml
-shots:
-  - shot_id: 1
-    text: >
-      Alex Chen, a male detective in his early 30s with short black hair
-      and a dark navy trench coat, walks into a brightly lit police station.
-      He carries a worn leather briefcase.
-    duration_seconds: 3.0
-
-  - shot_id: 2
-    text: >
-      Alex sits at a cluttered desk, studying a photograph under a desk lamp.
-      His trench coat hangs on a rack behind him.
-    duration_seconds: 3.0
-
-  - shot_id: 3
-    text: >
-      Alex walks quickly through a busy outdoor market, weaving through the crowd.
-    duration_seconds: 3.0
-```
-
-### 带 global_caption 格式（推荐用于复杂场景）
-
-当脚本里有多个角色、或 shot 描述使用了大量代词（"the man"、"he"、"they"），建议在文件开头加 `global_caption`。
-
-```yaml
-global_caption: >
-  The video depicts a tense scene in a sandy, desolate environment where a
-  bearded man armed with a sniper rifle is engaged in a standoff. He is seen
-  aiming his weapon, reacting to his surroundings, and pursuing a mysterious
-  masked figure dressed in black with a white face mask.
-
-shots:
-  - shot_id: 1
-    text: >
-      A close-up shot shows a bearded man intently looking through the scope
-      of a large sniper rifle, with a distorted "STOP" sign and sandy background.
-    duration_seconds: 3.0
-
-  - shot_id: 2
-    text: >
-      The camera pulls back. The man stands up, holding his rifle, while two
-      bodies lie on the ground behind him amidst sandbags.
-    duration_seconds: 3.0
-
-  - shot_id: 3
-    text: >
-      The armed man runs forward, following the masked figure between sandbags.
-    duration_seconds: 3.0
-```
-
-**global_caption 做了三件事：**
-
-1. **Shot 0 预解析**：Pipeline 正式处理镜头之前，先把 global_caption 单独送给 LLM 解析一次。LLM 从中提取所有出现的角色、物体、场景，为每个实体分配唯一 ID（`char_bearded_man`、`char_masked_figure`、`loc_desert`）并记录外观属性（胡子、服装、持有物等）。这份清单写入已知实体列表，供后续每个 shot 查用。
-
-2. **共指消解**：Shot 2 写的是 "The man stands up"——没有任何外观描述。解析 Shot 2 时，LLM 同时看到 global_caption，能把 "The man" 与已知实体 `char_bearded_man` 对应起来，而不是错误地创建一个新实体 `char_man`。
-
-3. **生成 prompt 增强**：发给视频生成模型的 prompt 是 `global_caption + shot_text`，模型在生成 Shot 2 时同时看到"这是个拿狙击枪的留胡子男人"和"他站起来向侧面看"，外观描述和动作描述都有，生成质量更稳定。
-
----
-
-## 环境与权重
-
-### 依赖安装
+### Step 1：环境配置
 
 ```bash
 # 基础依赖
@@ -254,143 +559,63 @@ pip install groundingdino-py
 pip install git+https://github.com/facebookresearch/sam2.git
 pip install insightface onnxruntime-gpu
 
-# 视频生成
-pip install diffusers transformers accelerate
-
-# 注意：flash_attn 在 glibc 2.27 环境下无法安装
-# Phantom 内置 fallback，直接跳过：pip uninstall flash_attn -y
+# FlashAttention（USP 序列并行需要）
+# Ubuntu 18.04 需要用预编译 wheel：
+pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.0.post2/flash_attn-2.7.0.post2+cu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
 ```
 
-### 权重文件
-
-| 模型 | 路径 | 用途 |
-|------|------|------|
-| Grounding DINO | `phase1_poc/weights/groundingdino_swinb_cogcoor.pth` | 从视频帧中检测实体位置 |
-| BERT | `phase1_poc/weights/bert-based-uncased/` | Grounding DINO 的文本编码器 |
-| SAM2 | `phase1_poc/weights/sam2_hiera_large.pt` | 精细分割角色轮廓 |
-| Wan2.1-T2V-14B | 配置在 `config.yaml` | 首镜头纯文本生成 |
-| Phantom-Wan-14B | 配置在 `config.yaml` | 后续镜头参考图外观 conditioning |
-
-### LLM API
-
-```bash
-# 查询当前可用模型
-curl -s -H "Authorization: Bearer $API_KEY" \
-  http://yy.dbh.baidu-int.com/v1/models | python3 -c "
-import json,sys; data=json.load(sys.stdin)
-[print(m['id']) for m in data.get('data',[]) if 'claude' in m['id']]
-"
-```
-
-当前可用 Claude 模型（2026-04）：
-
-| 模型 ID | 说明 |
-|---------|------|
-| `claude-sonnet-4-6-Anthropic` | **默认推荐** |
-| `claude-sonnet-4-6-chuangzuo` | 备用渠道 |
-| `claude-opus-4-6` | 更强推理能力，速度较慢 |
-
----
-
-## 快速开始
-
-### Step 1：验证 LLM 连通性
-
-```bash
-cd phase1_poc
-python utils/llm_client.py
-# 输出 "使用模型: claude-sonnet-4-6-Anthropic" 并有正常回复则通过
-```
-
-### Step 2：Mock 模式（无 GPU，验证 Pipeline 逻辑）
-
-Mock 模式跳过视频生成（输出彩色占位视频），但完整执行 LLM 解析、路由决策、报告生成，用来快速验证脚本解析是否正确。
+### Step 2：Mock 模式验证
 
 ```bash
 cd phase1_poc
 
 python run_demo.py \
-  --script ../configs/demo_script.yaml \
+  --script ../configs/test_sniper_standoff.yaml \
   --mock \
   --output ./output_mock
 ```
 
-**检查实体解析：同一角色是否跨镜头 ID 一致**
-
+检查实体解析是否正确：
 ```bash
 python -c "
 import json
 with open('./output_mock/pipeline_report.json') as f:
     r = json.load(f)
 for s in r['shots']:
-    print(f'Shot {s[\"shot_id\"]}: mode={s[\"generation_mode\"]:8s}  entities={s[\"entity_ids\"]}')
+    print(f'Shot {s[\"shot_id\"]}: mode={s[\"generation_mode\"]:8s} entities={s[\"entity_ids\"]}')
 "
 ```
 
-期望输出（`char_alex` 在全部镜头中 ID 相同）：
-```
-Shot 1: mode=mock      entities=['char_alex', 'obj_briefcase', 'loc_police_station']
-Shot 2: mode=mock      entities=['char_alex', 'loc_office', 'obj_desk_lamp']
-Shot 3: mode=mock      entities=['char_alex', 'loc_outdoor_market']
-Shot 4: mode=mock      entities=['char_alex', 'loc_street_night']
-```
-
-### Step 3：4 卡真实生成
+### Step 3：真实生成（8 卡）
 
 ```bash
 cd phase1_poc
 
-# A→B→A 场景回归测试（3 镜头，约 30 分钟）
-torchrun --nproc_per_node=4 run_demo.py \
-  --script ../configs/test_aba_scene.yaml \
-  --config ../configs/config.yaml \
-  --backend phantom \
-  --output ./output_aba
-
-# 带 global_caption 的 5 镜头测试（约 50 分钟）
-torchrun --nproc_per_node=4 run_demo.py \
+torchrun --nproc_per_node=8 run_demo.py \
   --script ../configs/test_sniper_standoff.yaml \
   --config ../configs/config.yaml \
   --backend phantom \
   --output ./output_sniper
 ```
 
-**检查路由是否正确（Shot 1 应为 t2v，后续应为 phantom）：**
-
+检查路由是否正确：
 ```bash
 python -c "
 import json
-with open('./output_aba/pipeline_report.json') as f:
+with open('./output_sniper/pipeline_report.json') as f:
     r = json.load(f)
 for s in r['flow_summary']:
-    print(f'Shot {s[\"shot_id\"]}: mode={s[\"mode\"]:8s}  refs_used={s[\"refs_used\"]}  grounded={s[\"crops_grounded\"]}')
+    print(f'Shot {s[\"shot_id\"]}: mode={s[\"mode\"]:8s} refs_used={s[\"refs_used\"]} grounded={s[\"crops_grounded\"]}')
 "
 ```
 
 期望输出：
 ```
-Shot 1: mode=t2v      refs_used=0  grounded=6   ← 首镜头无参考，生成后入库 6 张截图
-Shot 2: mode=phantom  refs_used=1  grounded=4   ← 用 Shot 1 的截图作参考
-Shot 3: mode=phantom  refs_used=2  grounded=6   ← 用 Shot 1+2 的截图作参考
-```
-
-### Step 4：多 seed 批量生成（对比多组结果）
-
-```bash
-# 用法: run_multi_seed.sh [运行次数] [输出目录] [脚本文件名]
-
-# 跑 5 次（seed=42/1337/2025/314159/777），输出到 output_sniper_multi/
-bash scripts/run_multi_seed.sh 5 ./output_sniper_multi test_sniper_standoff.yaml
-```
-
-输出结构：
-```
-output_sniper_multi/
-├── run_001_seed42/       ← videos/, crops/, registry/, pipeline_report.json
-├── run_002_seed1337/
-├── run_003_seed2025/
-├── run_004_seed314159/
-└── run_005_seed777/
+Shot 1: mode=t2v      refs_used=0  grounded=6   ← 首镜头无参考，生成后入库
+Shot 2: mode=phantom  refs_used=1  grounded=4   ← 用 Shot 1 的截图
+Shot 3: mode=phantom  refs_used=2  grounded=5
+Shot 4: mode=phantom  refs_used=2  grounded=4
+Shot 5: mode=phantom  refs_used=2  grounded=6
 ```
 
 ---
@@ -401,58 +626,133 @@ output_sniper_multi/
 
 ```yaml
 llm:
-  model: "claude-sonnet-4-6-Anthropic"   # 实体解析用的 LLM
+  model: "claude-haiku-4-5"        # 实体解析 LLM（haiku 成本低）
 
 generator:
-  num_inference_steps: 10    # 调试用 10 步（快），正式生成用 50 步（质量好）
-  guide_scale_text: 7.5      # 文本 prompt 的影响强度，越大越贴近文字描述
-  guide_scale_img:  5.0      # 参考图外观的影响强度（核心调参项）
-                             # 3.0 = 弱约束，角色外观可能漂移但动作更自然
-                             # 5.0 = 默认平衡值
-                             # 7.0 = 强约束，外观一致但动作可能偏僵硬
-  dit_fsdp: true             # 14B 模型参数分片到多卡，4 卡运行必须开启
-  t5_fsdp:  true             # 同上，T5 文本编码器也分片
+  num_inference_steps: 30          # 推理步数（30 步质量接近 50 步，快 40%）
+  guide_scale_text: 7.5            # 文本对齐强度
+  guide_scale_img:  5.0            # 参考图外观强度
+                                   # 3.0 = 弱约束，动作更自然
+                                   # 5.0 = 平衡
+                                   # 7.0 = 强约束，外观更一致但动作偏僵
+  use_usp:   true                  # USP 序列并行（需要 FlashAttention）
+  dit_fsdp:  true                  # DiT 模型参数分片
+  t5_fsdp:   true                  # T5 参数分片
 
 grounding:
-  box_threshold: 0.35        # Grounding DINO 检测阈值，越低检测到的框越多
-                             # 如果 grounded=0，尝试调低到 0.25
+  box_threshold: 0.35              # DINO 检测阈值，越低框越多
+
+reid:
+  min_quality_threshold: 0.4       # 参考图最低质量分
+```
+
+---
+
+## Debug 功能
+
+### Prompt 保存
+
+每个 shot 生成前，Pipeline 会将最终发送给模型的 prompt 保存到文件：
+
+```
+output/prompts/shot_001_prompt.txt
+output/prompts/shot_002_prompt.txt
+...
+```
+
+文件内容示例：
+```
+=== Shot 1 Generation Prompt ===
+Mode: t2v
+Seed: 43 (base=42)
+Shot type: medium
+Reference images: 0
+
+==================================================
+FINAL PROMPT TO MODEL:
+==================================================
+
+[Global Context]
+Visual style: cinematic, dramatic lighting.
+...
+
+[Shot Entities]
+Character: bearded man (gender: male, age: 40s).
+...
+
+A close-up shot shows a bearded man intently looking through...
+```
+
+### 实际使用的参考图记录
+
+每个 shot 实际输入模型的参考图会保存到 `used_refs/` 目录：
+
+```
+output/used_refs/
+├── shot_001/           # Shot 1（通常无参考图，T2V模式）
+├── shot_002/
+│   ├── char_elderly_man_00.jpg
+│   └── loc_living_room_00.jpg
+├── shot_003/
+│   ├── char_elderly_man_00.jpg    # 锚点：来自 shot 1
+│   ├── char_elderly_woman_00.jpg  # 锚点：来自 shot 1
+│   └── loc_living_room_00.jpg
+...
+```
+
+### Pipeline Report
+
+运行完成后，`pipeline_report.json` 包含完整的运行信息：
+
+```json
+{
+  "total_shots": 5,
+  "registry_stats": {...},
+  "flow_summary": [...],
+  "shots": [
+    {
+      "shot_id": 1,
+      "generation_mode": "t2v",
+      "entity_ids": ["char_bearded_sniper", "obj_sniper_rifle"],
+      "reference_used": {},
+      "grounded_entities": {...},
+      "metadata": {
+        "gen_prompt": "完整的生成 prompt..."
+      }
+    }
+  ]
+}
 ```
 
 ---
 
 ## 常见问题
 
-**Q：运行时报 `AssertionError: pipeline model parallel group is not initialized`**
+**Q：`AssertionError: FlashAttention is not available`**
 
-`config.yaml` 中 `use_usp` 必须为 `false`。`use_usp: true` 需要 xfuser 初始化额外的并行组，目前未启用。
-
-**Q：CUDA out of memory（加载 Phantom S2V 时报 OOM）**
-
-- 确认 `dit_fsdp: true` 和 `t5_fsdp: true` 已开启（14B 模型必须 4 卡分片，否则每卡需要 56GB）
-- 用 `nvidia-smi` 检查是否有其他进程占用显存
-- 确认使用 `torchrun --nproc_per_node=4` 启动，而不是直接 `python`
-
-**Q：Shot 2 开始视频风格变成动画/插画风**
-
-原因：从 Shot 1 的视频中裁切到的角色截图太小（角色在画面中只占很小一部分），截图 pad 成 832×480 后角色主体面积不足 1%，Phantom 无法从中提取有效外观信息，就退化为"凭感觉生成"，而模型本身有插画风格偏好。
-
-解法：调低 `grounding.box_threshold`（如 0.25），让 DINO 在更宽松的阈值下找到更大的检测框。
+A：需要安装 FlashAttention。Ubuntu 18.04 使用预编译 wheel：
+```bash
+pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.0.post2/flash_attn-2.7.0.post2+cu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
+```
+或者禁用 USP（`use_usp: false`），使用纯 FSDP。
 
 **Q：Shot 2 路由走了 t2v 而不是 phantom**
 
-说明 Shot 1 的 Grounding 没有找到任何角色。检查 `pipeline_report.json` 中 Shot 1 的 `crops_grounded`，如果为 0，原因通常是：
-1. Grounding DINO 权重路径配置错误
-2. `box_threshold` 太高，降低到 0.25 试试
+A：Shot 1 的 Grounding 没有找到角色。检查 `pipeline_report.json` 中 Shot 1 的 `crops_grounded`：
+- 若为 0，调低 `box_threshold` 到 0.25
+- 检查 Grounding DINO 权重路径是否正确
 
-**Q：同一个角色在不同镜头被识别成两个不同 ID（如 `char_alex` 和 `char_man`）**
+**Q：同一角色被识别成不同 ID（如 `char_alex` 和 `char_man`）**
 
-LLM 共指消解失败。解法：
-1. 在 YAML 里加 `global_caption`，统一角色描述，LLM 在全局上下文下消解更准确
-2. 或者在每个 shot 的文字描述中保持角色描述一致，不要只写代词
+A：LLM 共指消解失败。解决：
+1. 添加 `global_caption` 统一描述
+2. 每个 shot 保持角色描述一致，避免只用代词
 
-**Q：API 报 `model_not_found` 503 错误**
+**Q：CUDA OOM**
 
-模型 ID 写错了。以 `http://yy.dbh.baidu-int.com/v1/models` 接口返回的列表为准，当前可用的是 `claude-sonnet-4-6-Anthropic` 而不是 `claude-sonnet-4-6`。
+A：确认多卡配置正确：
+- `dit_fsdp: true` 和 `t5_fsdp: true` 必须开启
+- 使用 `torchrun --nproc_per_node=8` 启动
 
 ---
 
@@ -460,22 +760,8 @@ LLM 共指消解失败。解法：
 
 | 脚本 | 镜头数 | 有无 global_caption | 测试重点 |
 |------|--------|---------------------|---------|
-| `demo_script.yaml` | 4 | 无 | 基础功能验证，单角色跨室内/户外/雨夜 |
-| `test_aba_scene.yaml` | 3 | 无 | **场景回归**：书房 → 仓库 → 回到书房，验证场景和角色同时保持一致 |
-| `test_sniper_standoff.yaml` | 5 | **有** | global_caption + 代词共指消解，验证 Shot 2-5 的 "the man" 都能正确识别 |
-| `test_dual_character.yaml` | 5 | 无 | 双角色，验证两个角色分别入库、互不干扰 |
-
-**`test_aba_scene.yaml` 预期执行过程：**
-```
-Shot 1 → WanT2V（无参考，首镜头）
-         生成书房场景，Marcus 坐在木质大桌前
-         → Grounding 入库：char_marcus（人物截图）、loc_study_room（背景截图）
-
-Shot 2 → Phantom S2V（char_marcus 有参考图）
-         换到仓库场景，外观参考 Shot 1 的 Marcus 截图
-         → Grounding 入库：char_marcus 更新，loc_warehouse 新增
-
-Shot 3 → Phantom S2V（char_marcus + loc_study_room 都有参考图）
-         回到书房，同时参考人物截图和书房背景截图
-         → 验证：Marcus 外观与 Shot 1 一致，书房视觉风格与 Shot 1 接近
-```
+| `demo_script.yaml` | 4 | 无 | 基础功能，单角色 |
+| `test_aba_scene.yaml` | 3 | 无 | 场景回归：书房→仓库→书房 |
+| `test_sniper_standoff.yaml` | 5 | **有** | 代词共指消解 |
+| `test_dual_character.yaml` | 5 | 无 | 双角色互不干扰 |
+| `test_scene_consistency.yaml` | 4 | 无 | 场景一致性 |

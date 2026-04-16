@@ -9,7 +9,7 @@ set -e
 
 RUNS=${1:-3}
 BASE_OUTPUT=${2:-"/root/paddlejob/workspace/env_run/output/lyx/T2V_Grounding/phase1_poc/output_multi_seed"}
-SCRIPT_NAME=${3:-"test_sniper_standoff.yaml"}
+SCRIPT_NAME=${3:-"test_elderly_couple.yaml"}
 
 SCRIPT="/root/paddlejob/workspace/env_run/output/lyx/T2V_Grounding/configs/${SCRIPT_NAME}"
 CONFIG="/root/paddlejob/workspace/env_run/output/lyx/T2V_Grounding/configs/config.yaml"

@@ -1,272 +1,316 @@
-# Grounding-in-the-Loop: Agentic Multi-Shot Text-to-Video Generation with Visual Entity Consistency
+\documentclass[10pt,twocolumn]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{algorithm}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
 
-**Anonymous Authors**
+\title{Grounding-in-the-Loop: Agentic Multi-Shot Text-to-Video Generation with Visual Entity Consistency}
 
----
+\author{Anonymous Authors}
 
-## Abstract
+\begin{document}
 
-We present **T2V-Grounding**, an agentic framework for generating multi-shot videos with consistent visual identity across shots. Existing text-to-video (T2V) models generate each shot independently, leading to severe character appearance drift in multi-shot narratives. The key insight of our method is to close the generation-perception loop: after each shot is generated, we apply open-vocabulary visual grounding to extract high-quality entity crops from the generated video, store them in a persistent **Entity Registry**, and use them as visual references to condition subsequent shot generation via a subject-to-video (S2V) model. An LLM-driven entity parser handles cross-shot coreference resolution to maintain consistent entity identities throughout the script. Our framework requires no training and can be applied on top of any T2V and S2V generation backbone. Experiments on multi-shot scripts with up to 6 shots demonstrate that T2V-Grounding significantly improves cross-shot character consistency, achieving +0.18 CLIP-I and +0.21 FaceID improvement over baseline T2V generation.
+\maketitle
 
----
+% ============================================================================
+\begin{abstract}
+Omit for now.
+\end{abstract}
 
-## 1. Introduction
+% ============================================================================
+\section{Introduction}
 
-The problem of generating a coherent multi-shot video from a text script is fundamentally different from single-shot video generation. A compelling visual narrative requires that the same character appearing across different shots—in different scenes, lighting conditions, camera angles, and actions—be recognizably the same person. Current state-of-the-art T2V models [Wan2.1, CogVideoX, Gen-3] treat each shot as an independent generation task, resulting in significant character appearance drift that renders multi-shot narratives visually incoherent.
+The problem of generating a coherent multi-shot video from a text script is fundamentally different from single-shot video generation. A compelling visual narrative requires that the same character appearing across different shots---in different scenes, lighting conditions, camera angles, and actions---be recognizably the same person. Current state-of-the-art T2V models~\cite{wan2024wan,yang2024cogvideox,gen3} treat each shot as an independent generation task, resulting in significant character appearance drift that renders multi-shot narratives visually incoherent.
 
-Several directions have been proposed to address visual consistency in generative models. Image-to-video (I2V) methods [Wan-I2V] condition generation on a reference first frame, but this locks both the character appearance *and* the composition/pose—unsuitable for shots with different camera angles or actions. Training-based approaches [DreamBooth-Video, DreamVideo] require per-character fine-tuning, which is impractical at inference time. Reference-conditioned generation approaches [IP-Adapter, Phantom] can condition on appearance without fixing pose, but they assume reference images are available as inputs—raising the question of where these references come from in an automated pipeline.
+Several directions have been proposed to address visual consistency in generative models. Image-to-video (I2V) methods~\cite{wan2024wan} condition generation on a reference first frame, but this locks both the character appearance \emph{and} the composition/pose---unsuitable for shots with different camera angles or actions. Training-based approaches~\cite{dreambooth_video,dreamvideo} require per-character fine-tuning, which is impractical at inference time. Reference-conditioned generation approaches~\cite{ye2023ip,phantom} can condition on appearance without fixing pose, but they assume reference images are available as inputs---raising the question of where these references come from in an automated pipeline.
 
-Our key observation is: **the generated video itself is the best source of reference images for future shots.** Rather than relying on an external character database or manual reference image provision, we propose to extract reference images *from each generated shot* using visual grounding, and use them to condition subsequent shots. This creates a generation-grounding feedback loop that progressively builds a richer visual reference bank as more shots are generated.
+Our key observation is: \textbf{the generated video itself is the best source of reference images for future shots.} Rather than relying on an external character database or manual reference image provision, we propose to extract reference images \emph{from each generated shot} using visual grounding, and use them to condition subsequent shots. This creates a generation-grounding feedback loop that progressively builds a richer visual reference bank as more shots are generated.
 
 We make the following contributions:
-1. A training-free **agentic pipeline** that maintains character visual consistency across multi-shot T2V generation without requiring external reference images.
-2. A **post-generation grounding** paradigm, where entity crops are extracted from generated videos (not assumed available beforehand) using open-vocabulary detection and segmentation.
-3. A **persistent Entity Registry** with Re-ID quality scoring that stores and retrieves the best visual references across shots.
-4. An **LLM-driven entity parser** that performs cross-shot coreference resolution, ensuring semantic entity identity (e.g., "the detective" in shot 3 = "Alex" from shot 1) is maintained throughout the script.
+\begin{enumerate}
+    \item A training-free \textbf{agentic pipeline} that maintains character visual consistency across multi-shot T2V generation without requiring external reference images.
+    \item A \textbf{post-generation grounding} paradigm, where entity crops are extracted from generated videos (not assumed available beforehand) using open-vocabulary detection and segmentation.
+    \item A \textbf{persistent Entity Registry} with Re-ID quality scoring that stores and retrieves the best visual references across shots.
+    \item An \textbf{LLM-driven entity parser} that performs cross-shot coreference resolution, ensuring semantic entity identity (e.g., ``the detective'' in shot 3 = ``Alex'' from shot 1) is maintained throughout the script.
+\end{enumerate}
 
----
+% ============================================================================
+\section{Related Work}
 
-## 2. Related Work
+Omit for now.
 
-**Text-to-Video Generation.** Large-scale T2V models [Wan2.1, CogVideoX, Sora, KLING, Gen-3, VideoCrafter2] have achieved remarkable realism and text alignment for single shots. However, they lack any mechanism for inter-shot consistency, as each generation is conditioned only on a text prompt.
+\section{Method}
 
-**Reference-Conditioned Video Generation.** IP-Adapter [ye2023ip] and its video extensions inject reference image features into cross-attention layers of diffusion models. Phantom [Phantom] extends this to video generation by encoding reference images as VAE latent tokens and concatenating them temporally with the noise tokens, achieving appearance conditioning without pose lock-in. Our method uses Phantom as the S2V backbone for subsequent shots, but the core contribution is the automated reference extraction and management pipeline.
+We introduce T2V-Grounding, an agentic pipeline for multi-shot video generation with cross-shot entity consistency. Given a multi-shot script $\mathcal{S} = \{s_1, s_2, \ldots, s_N\}$ where each shot $s_n$ is a natural language description, and an optional global caption $\mathcal{C}_{\text{global}}$ that describes the overall narrative context, our goal is to generate a sequence of videos $\mathcal{V} = \{v_1, v_2, \ldots, v_N\}$ such that entities appearing across multiple shots maintain consistent visual identity.
 
-**Image-to-Video Generation.** I2V models [Wan-I2V, AnimateDiff] condition the video on an initial frame, effectively providing strong appearance control. However, this approach locks the first frame composition and is unsuitable for generating shots with different viewpoints or camera angles. We explicitly avoid I2V as our reference conditioning backbone for this reason.
+The pipeline consists of six components: (1) an LLM-based Entity Parser, (2) a Global Context Extractor, (3) an Entity Registry, (4) a Visual Grounding Module, (5) a Reference Quality Scorer, and (6) an Adaptive Video Generator. These are orchestrated by an agentic loop that processes shots sequentially. A key design is our \textbf{three-layer prompt construction}, which separates global semantic context (style, mood, setting) from shot-specific entity descriptions and action text, preventing entity leakage across shots while maintaining stylistic coherence.
 
-**Character-Consistent Story Generation.** StoryMaker [storymaker], ConsistentStory [consistentstory], and TheaterGen [theatergen] address character consistency in *image* story generation. These methods operate in the single-image domain and do not directly apply to video generation. Multi-shot video consistency is significantly harder due to temporal dynamics and the curse of independent generation.
-
-**Visual Grounding and Segmentation.** Grounding DINO [gdino] enables open-vocabulary object detection using text queries, allowing us to locate any named entity in a video frame without pre-defined categories. SAM2 [sam2] provides high-quality instance segmentation for any detected box. Together, they enable precise entity crop extraction from generated videos.
-
-**Re-Identification.** Person Re-ID [reid] and face recognition methods [insightface] provide quality metrics for determining the best reference crops. We adopt a composite scoring function that combines face identity confidence, image sharpness, and viewing angle to select reference images that maximally benefit subsequent generation.
-
----
-
-## 3. Method
-
-We introduce T2V-Grounding, an agentic pipeline for multi-shot video generation with cross-shot entity consistency. Given a multi-shot script $\mathcal{S} = \{s_1, s_2, \ldots, s_N\}$ where each shot $s_n$ is a natural language description, our goal is to generate a sequence of videos $\mathcal{V} = \{v_1, v_2, \ldots, v_N\}$ such that entities appearing across multiple shots maintain consistent visual identity.
-
-The pipeline consists of five components (Figure 1): (1) an LLM-based Entity Parser, (2) an Entity Registry, (3) a Visual Grounding Module, (4) a Reference Quality Scorer, and (5) an Adaptive Video Generator. These are orchestrated by an agentic loop that processes shots sequentially.
-
-### 3.1 LLM-Based Entity Parser with Cross-Shot Coreference
+% ----------------------------------------------------------------------------
+\subsection{LLM-Based Entity Parser with Cross-Shot Coreference}
 
 Before generating shot $n$, we run the Entity Parser to extract a structured entity list from the shot text $s_n$.
 
-**Entity Extraction.** A language model $\mathcal{M}_\text{LLM}$ processes the shot description along with an accumulated context of known entities from previous shots:
-
-$$\mathcal{E}_n = \mathcal{M}_\text{LLM}(s_n,\ \mathcal{K}_{n-1})$$
-
+\textbf{Entity Extraction.} A language model $\mathcal{M}_{\text{LLM}}$ processes the shot description along with an accumulated context of known entities from previous shots:
+\begin{equation}
+\mathcal{E}_n = \mathcal{M}_{\text{LLM}}(s_n,\ \mathcal{K}_{n-1})
+\end{equation}
 where $\mathcal{K}_{n-1} = \{e \mid e \in \bigcup_{i<n} \mathcal{E}_i,\ e.\text{is\_new} = \texttt{true}\}$ is the set of all entities introduced in previous shots. The parser produces a list of entity records, where each entity $e$ contains:
-- $e.\text{entity\_id}$: a stable cross-shot identifier (e.g., `char_alex`, `obj_briefcase`)
-- $e.\text{type} \in \{\texttt{character}, \texttt{object}, \texttt{location}, \texttt{style}\}$
-- $e.\text{text\_description}$: the natural language description used for grounding
-- $e.\text{grounding\_priority} \in \{\texttt{high}, \texttt{medium}, \texttt{low}\}$
-- $e.\text{is\_new}$: whether this entity first appears in the current shot
+\begin{itemize}
+    \item $e.\text{entity\_id}$: a stable cross-shot identifier (e.g., \texttt{char\_alex}, \texttt{obj\_briefcase})
+    \item $e.\text{type} \in \{\texttt{character}, \texttt{object}, \texttt{location}, \texttt{style}\}$
+    \item $e.\text{text\_description}$: the natural language description used for grounding
+    \item $e.\text{grounding\_priority} \in \{\texttt{high}, \texttt{medium}, \texttt{low}\}$
+    \item $e.\text{is\_new}$: whether this entity first appears in the current shot
+\end{itemize}
 
-**Cross-Shot Coreference Resolution.** A critical challenge is that the same entity may be referred to differently across shots: "Alex" in shot 1 may appear as "the detective" in shot 3 or "he" in shot 4. We address this by providing the LLM with $\mathcal{K}_{n-1}$ as context and instructing it to assign the same `entity_id` to coreferred entities. The LLM also maintains an alias list for each entity, enabling robust matching even under diverse referring expressions.
+\textbf{Cross-Shot Coreference Resolution.} A critical challenge is that the same entity may be referred to differently across shots: ``Alex'' in shot 1 may appear as ``the detective'' in shot 3 or ``he'' in shot 4. We address this by providing the LLM with $\mathcal{K}_{n-1}$ as context and instructing it to assign the same \texttt{entity\_id} to coreferred entities. The LLM also maintains an alias list for each entity, enabling robust matching even under diverse referring expressions.
 
-This LLM-based approach handles the full diversity of natural language references without requiring manual entity specification, making the system applicable to arbitrary scripts.
+\textbf{Global Context Extraction.} In addition to entity extraction, the parser also extracts global semantic context from an optional \texttt{global\_caption} that describes the overall video narrative. This global context is decomposed into four dimensions:
+\begin{itemize}
+    \item $\text{visual\_style}$: Cinematographic style (e.g., ``cinematic, dramatic lighting'')
+    \item $\text{mood}$: Emotional atmosphere (e.g., ``tense, suspenseful'')
+    \item $\text{setting}$: Environmental description (e.g., ``sandy desolate desert'')
+    \item $\text{narrative\_context}$: Story context (e.g., ``a standoff and pursuit sequence'')
+\end{itemize}
 
-### 3.2 Adaptive Video Generation with Generation Mode Routing
+Critically, the global context \textbf{excludes specific entity descriptions} to avoid injecting characters that should not appear in the current shot.
+
+% ----------------------------------------------------------------------------
+\subsection{Adaptive Video Generation with Mode Routing}
 
 Given the entity list $\mathcal{E}_n$ and the Entity Registry state $\mathcal{R}_{n-1}$, we route shot $n$ to one of two generation modes:
 
-**T2V Mode (Shot 1 or new entities).** When no visual references are available for any high-priority entity (i.e., the registry is empty or all relevant entities are new), we use a pure text-to-video model $\mathcal{G}_\text{T2V}$:
+\textbf{T2V Mode (Shot 1 or new entities).} When no visual references are available for any high-priority entity (i.e., the registry is empty or all relevant entities are new), we use a pure text-to-video model $\mathcal{G}_{\text{T2V}}$:
+\begin{equation}
+v_n = \mathcal{G}_{\text{T2V}}(s_n)
+\end{equation}
 
-$$v_n = \mathcal{G}_\text{T2V}(s_n)$$
+\textbf{S2V Mode (subsequent shots with references).} When the registry contains reference crops for at least one high-priority entity in shot $n$, we switch to a subject-to-video model $\mathcal{G}_{\text{S2V}}$:
+\begin{equation}
+v_n = \mathcal{G}_{\text{S2V}}(s_n,\ \mathcal{I}_n)
+\end{equation}
+where $\mathcal{I}_n$ is the set of reference images retrieved from the registry.
 
-We use Wan2.1-T2V-14B as our T2V backbone. This mode is necessarily used for shot 1, as no reference images have been generated yet.
+\textbf{Why S2V and not I2V?} Image-to-video models treat the reference image as the first video frame, strongly constraining both appearance \emph{and} spatial layout/pose. This makes I2V unsuitable for shots with different camera angles or actions. S2V models like Phantom instead encode reference images as appearance tokens in a parallel conditioning stream, exerting appearance-level influence without fixing spatial structure.
 
-**S2V Mode (subsequent shots with references).** When the registry contains reference crops for at least one high-priority entity in shot $n$, we switch to a subject-to-video model $\mathcal{G}_\text{S2V}$:
+\textbf{Reference Image Retrieval with Anchor Strategy.} A critical observation is that \emph{appearance drift accumulates across shots}: the later a shot is generated, the more likely the character's face deviates from its original appearance. If we always use the most recent shot's grounding result as the reference, errors compound progressively.
 
-$$v_n = \mathcal{G}_\text{S2V}(s_n,\ \mathcal{I}_n)$$
+To address this, we introduce an \textbf{anchor strategy} for character entities: instead of retrieving the most recent reference, we always retrieve the \textbf{earliest high-quality reference} (the ``anchor'') for each entity. This ensures that all shots reference the original, uncontaminated appearance established in the entity's first appearance.
 
-where $\mathcal{I}_n$ is the set of reference images retrieved from the registry. We use Phantom-Wan-14B as our S2V backbone.
+\begin{equation}
+\mathcal{I}_{\text{anchor}}(e) = \mathcal{R}.\texttt{query\_anchor}(e.\text{entity\_id},\ \tau_q=0.5)
+\end{equation}
 
-**Why S2V and not I2V?** Image-to-video models treat the reference image as the first video frame, strongly constraining both appearance *and* spatial layout/pose. This makes I2V unsuitable for shots with different camera angles or actions—a detective looking determined while walking (shot 1) cannot serve as the first frame for a close-up shot of his conflicted face in the rain (shot 4). S2V models like Phantom instead encode reference images as appearance tokens in a parallel conditioning stream, exerting appearance-level influence without fixing spatial structure. This allows the generation to remain compositionally free while maintaining visual identity.
+where \texttt{query\_anchor} returns the entry with minimum \texttt{shot\_id} among all entries with quality $\geq \tau_q$.
 
-**Reference Image Retrieval.** For a shot with high-priority entities $\hat{\mathcal{E}}_n = \{e \in \mathcal{E}_n \mid e.\text{grounding\_priority} \in \{\texttt{high}, \texttt{medium}\}\}$, we retrieve reference images from the registry:
+\textbf{Shot-Type Adaptive Reference Selection.} We observe that the optimal number of reference images depends on the shot type. A close-up focusing on a single character should not receive multiple character references, as this confuses the generation model's composition decisions. We automatically detect shot types via keyword matching and adapt reference selection accordingly:
 
-$$\mathcal{I}_n = \bigcup_{e \in \hat{\mathcal{E}}_n} \mathcal{R}_{n-1}.\texttt{query}(e.\text{entity\_id},\ k=1)$$
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Shot Type} & \textbf{Keywords} & \textbf{Max Char Refs} & \textbf{Include Location} \\
+\midrule
+Close-up & ``close-up'', ``tight shot'' & 1 & No \\
+Wide shot & ``wide shot'', ``establishing'' & 3 & Yes \\
+Medium (default) & -- & 2 & Yes \\
+\bottomrule
+\end{tabular}
+\end{center}
 
-We retrieve the single best-scored reference per entity and cap the total at 4 images (Phantom's maximum). Priority is given to `high`-priority entities (characters and key objects) over `medium`-priority ones (locations).
+For close-up shots, omitting the location reference allows the background to naturally blur/defocus, emphasizing the subject.
 
-**Reference Image Preprocessing.** To ensure consistent VAE encoding across reference images of varying source sizes, all retrieved crops are resized and padded to the target video resolution $(W, H)$ while preserving aspect ratio, with white padding for letterboxed content.
+\textbf{Per-Shot Seed Increment.} To increase generation diversity across shots (avoiding the tendency for similar prompts with similar references to produce nearly identical outputs), we use an incremented seed for each shot: $\text{seed}_n = \text{seed}_{\text{base}} + n$.
 
-### 3.3 Post-Generation Visual Grounding
+\textbf{Reference Image Retrieval with Location Priority.} We observe that maintaining \emph{scene consistency} is as important as character consistency for coherent multi-shot narratives. A desert scene in shot 1 should remain visually consistent in shot 3, even if the camera angle changes. To enforce this, we separate entity retrieval into two streams:
 
-After generating video $v_n$, we perform visual grounding to extract entity crops that will serve as references for subsequent shots. This is the "grounding-in-the-loop" step that distinguishes our method from prior approaches.
+\textbf{(1) Non-location entities} (characters, objects): We retrieve references sorted by grounding priority (high $\rightarrow$ medium), taking at most 3 references to reserve capacity for the location reference:
+\begin{equation}
+\mathcal{I}_{\text{non-loc}} = \bigcup_{e \in \mathcal{E}_n^{\text{non-loc}}} \mathcal{R}_{n-1}.\texttt{query}(e.\text{entity\_id},\ k=1,\ \tau_q=0.4)
+\end{equation}
 
-**Why post-generation grounding?** One might ask: why not use T2I models to generate reference images before video generation? We argue that references extracted from the *actual generated video* are strictly preferable: (1) they are visually consistent with the video backbone's style and color space; (2) they capture the entity's appearance as rendered by the generation model, avoiding cross-model style inconsistency; and (3) they naturally reflect the diversity of poses, lighting, and contexts already established in the generated footage.
+\textbf{(2) Location entities}: For each location entity in the current shot, we check if the registry contains a reference. If yes, we \textbf{must} include it to ensure scene consistency. We use a lower quality threshold ($\tau_q=0.3$) since background inpainting quality varies:
+\begin{equation}
+\mathcal{I}_{\text{loc}} = \bigcup_{e \in \mathcal{E}_n^{\text{loc}}} \mathcal{R}_{n-1}.\texttt{query}(e.\text{entity\_id},\ k=1,\ \tau_q=0.3)
+\end{equation}
 
-**Frame Extraction.** We uniformly sample frames from $v_n$ at 1 FPS using ffmpeg, yielding a set of frames $\mathcal{F}_n = \{f_1, f_2, \ldots, f_K\}$.
+If a location entity has no registry entry, it is treated as a \emph{new scene}---the shot will be generated without location conditioning, and the location will be grounded and registered after generation for use in subsequent shots.
 
-**Open-Vocabulary Detection.** For each entity $e \in \mathcal{E}_n$ with priority $\neq \texttt{low}$, we run Grounding DINO on each frame using the entity's `text_description` as the text query:
+The final reference set is $\mathcal{I}_n = \mathcal{I}_{\text{non-loc}} \cup \mathcal{I}_{\text{loc|}|}$, capped at 4 images (the S2V model's maximum).
 
-$$\mathcal{B}_{e,k} = \texttt{GDINO}(f_k,\ e.\text{text\_description},\ \tau_\text{box})$$
+% ----------------------------------------------------------------------------
+\subsection{Three-Layer Prompt Construction}
 
-where $\mathcal{B}_{e,k}$ is the set of detected bounding boxes with scores above threshold $\tau_\text{box} = 0.35$. For each detected box, we run SAM2 to obtain a refined segmentation mask $m_{e,k}$, and extract the masked crop:
+A naive approach would directly concatenate the \texttt{global\_caption} with the shot description. However, this introduces a critical problem: the global caption typically describes the entire video narrative, potentially mentioning characters or events that should not appear in the current shot. To address this, we construct the generation prompt in three carefully designed layers:
 
-$$c_{e,k} = \texttt{MaskedCrop}(f_k,\ m_{e,k})$$
+\textbf{Layer 1: Global Context.} Semantic attributes extracted from the global caption that apply uniformly across all shots: visual style, mood, setting, and narrative context. This layer explicitly excludes specific entity descriptions.
+\begin{equation}
+\text{prompt}_{\text{global}} = \texttt{BuildGlobalContext}(\mathcal{C}_{\text{global}})
+\end{equation}
 
-### 3.4 Reference Quality Scoring
+\textbf{Layer 2: Shot Entity Context.} Detailed descriptions of entities that \emph{actually appear in the current shot}, retrieved from the entity graph. For each entity $e \in \mathcal{E}_n$ with priority $\neq \texttt{low}$, we format its attributes as:
+\begin{equation}
+\text{prompt}_{\text{entity}} = \bigcup_{e \in \mathcal{E}_n} \texttt{FormatEntity}(e.\text{type}, e.\text{desc}, e.\text{attr})
+\end{equation}
 
-Not all extracted crops are equally useful as visual references. A blurry back-of-head crop of a character is a poor reference; a sharp frontal face crop is an excellent one. We compute a composite quality score $q(c)$ for each crop $c$:
+\textbf{Layer 3: Shot Description.} The original shot text $s_n$ describing the specific action, camera movement, and composition.
 
-$$q(c) = \alpha_1 \cdot q_\text{sharp}(c) + \alpha_2 \cdot q_\text{id}(c) + \alpha_3 \cdot q_\text{pose}(c)$$
+The final prompt is constructed as:
+\begin{equation}
+\text{prompt}_n = \text{prompt}_{\text{global}} \oplus \text{prompt}_{\text{entity}} \oplus s_n
+\end{equation}
 
+This three-layer design ensures that: (1) stylistic coherence is maintained across shots via the global context, (2) only relevant entities are described to the generation model, and (3) the original creative intent of each shot is preserved.
+
+% ----------------------------------------------------------------------------
+\subsection{Post-Generation Visual Grounding}
+
+After generating video $v_n$, we perform visual grounding to extract entity crops that will serve as references for subsequent shots. This is the ``grounding-in-the-loop'' step that distinguishes our method from prior approaches.
+
+\textbf{Why post-generation grounding?} References extracted from the \emph{actual generated video} are strictly preferable: (1) they are visually consistent with the video backbone's style and color space; (2) they capture the entity's appearance as rendered by the generation model; and (3) they naturally reflect the diversity of poses and lighting already established.
+
+\textbf{Frame Extraction.} We uniformly sample frames from $v_n$ at 1 FPS, yielding a set of frames $\mathcal{F}_n = \{f_1, f_2, \ldots, f_K\}$.
+
+\textbf{Open-Vocabulary Detection.} For each entity $e \in \mathcal{E}_n$ with priority $\neq \texttt{low}$, we run Grounding DINO~\cite{liu2023grounding} on each frame:
+\begin{equation}
+\mathcal{B}_{e,k} = \texttt{GDINO}(f_k,\ e.\text{text\_description},\ \tau_{\text{box}})
+\end{equation}
+For each detected box, we run SAM2~\cite{ravi2024sam2} to obtain a refined segmentation mask $m_{e,k}$, and extract the masked crop with white background:
+\begin{equation}
+c_{e,k} = \texttt{MaskedCrop}(f_k,\ m_{e,k})
+\end{equation}
+
+\textbf{Cross-Entity IoU Deduplication.} In multi-person scenes, open-vocabulary detection may incorrectly localize entity $A$'s bounding box onto entity $B$ (e.g., detecting ``young boy'' on an ``elderly man'' since both are persons). To address this, we perform cross-entity IoU deduplication within each frame:
+
+\begin{enumerate}
+    \item Collect all detection results across all entities for each frame.
+    \item Sort detections by confidence score (descending).
+    \item For each detection, suppress any lower-confidence detection from a \emph{different} entity with IoU $> \tau_{\text{IoU}}$ (default 0.5).
+\end{enumerate}
+
+This ensures that each detected region is assigned to at most one entity---the one with highest detection confidence.
+
+\textbf{Location Entity Extraction via Background Inpainting.} For \texttt{location}-type entities (e.g., ``sandy desert'', ``rainy alley''), we need a clean background reference without foreground characters or objects. We achieve this through a foreground removal pipeline:
+\begin{enumerate}
+    \item Detect all foreground elements using a broad query (``person . people . man . woman . object . bag . item'') with Grounding DINO.
+    \item For each detected box, obtain a precise segmentation mask via SAM2.
+    \item Compute the union of all foreground masks and apply morphological dilation to avoid edge artifacts.
+    \item Use \texttt{cv2.inpaint} (Telea algorithm) to fill the masked foreground regions, yielding a clean background frame.
+\end{enumerate}
+This inpainted background serves as the location reference for subsequent shots, ensuring scene consistency without character contamination.
+
+% ----------------------------------------------------------------------------
+\subsection{Reference Quality Scoring}
+
+Not all extracted crops are equally useful as visual references. We compute a composite quality score $q(c)$ for each crop $c$:
+\begin{equation}
+q(c) = \alpha_1 \cdot q_{\text{sharp}}(c) + \alpha_2 \cdot q_{\text{id}}(c) + \alpha_3 \cdot q_{\text{pose}}(c)
+\end{equation}
 with $\alpha_1 = 0.4$, $\alpha_2 = 0.4$, $\alpha_3 = 0.2$.
 
-- **$q_\text{sharp}$**: Laplacian variance normalized to [0,1], measuring image sharpness.
-- **$q_\text{id}$**: For `character`-type entities, the face detection confidence from InsightFace; for other entity types, the CLIP cosine similarity between the crop and the entity text description.
-- **$q_\text{pose}$**: For characters, a heuristic frontal score based on face landmark yaw/pitch angles; for objects/locations, this term is set to 1.
+\begin{itemize}
+    \item $q_{\text{sharp}}$: Laplacian variance normalized to [0,1], measuring image sharpness.
+    \item $q_{\text{id}}$: For \texttt{character}-type entities, the face detection confidence from InsightFace~\cite{insightface}; for other entity types, the CLIP cosine similarity.
+    \item $q_{\text{pose}}$: For characters, a heuristic frontal score based on face landmark yaw/pitch angles; for objects/locations, this term is set to 1.
+\end{itemize}
 
-We discard crops with $q(c) < \tau_q = 0.4$ and keep at most $K_\text{max} = 3$ best crops per entity per shot.
+We discard crops with $q(c) < \tau_q = 0.4$ and keep at most $K_{\text{max}} = 3$ best crops per entity per shot.
 
-### 3.5 Entity Registry
+% ----------------------------------------------------------------------------
+\subsection{Entity Registry}
 
 The Entity Registry $\mathcal{R}$ is a persistent key-value store mapping entity IDs to ranked lists of reference entries. Each entry stores the crop path, quality score, source shot ID, and grounding metadata.
 
-The registry supports two operations:
-- $\texttt{register}(e.\text{entity\_id},\ \text{entry})$: Insert a new reference entry with its quality score.
-- $\texttt{query}(e.\text{entity\_id},\ k,\ \tau_q)$: Retrieve the top-$k$ entries with score $\geq \tau_q$, sorted by quality score descending.
+The registry supports three key operations:
+\begin{itemize}
+    \item $\texttt{register}(e.\text{entity\_id},\ \text{entry})$: Insert a new reference entry.
+    \item $\texttt{query}(e.\text{entity\_id},\ k,\ \tau_q,\ \text{strategy})$: Retrieve the top-$k$ entries with score $\geq \tau_q$, ordered by the specified strategy.
+    \item $\texttt{query\_anchor}(e.\text{entity\_id},\ \tau_q)$: Retrieve the single best ``anchor'' reference---the earliest high-quality entry.
+\end{itemize}
 
-An important property: the registry accumulates references **across shots**. By shot $n$, the registry contains references extracted from $v_1, \ldots, v_{n-1}$, meaning each subsequent shot benefits from progressively more diverse reference images showing the character in different contexts.
+\textbf{Query Strategies.} The \texttt{query} operation supports three ordering strategies:
+\begin{itemize}
+    \item \texttt{earliest\_good} (default): Sort by \texttt{shot\_id} ascending, then quality descending. This implements the anchor strategy, preventing error accumulation.
+    \item \texttt{best\_quality}: Sort by quality descending. May select drifted references from later shots.
+    \item \texttt{most\_recent}: Sort by \texttt{shot\_id} descending. Legacy behavior, causes error accumulation.
+\end{itemize}
 
-### 3.6 Agentic Orchestration Loop
+An important property: the registry accumulates references \textbf{across shots}. By shot $n$, the registry contains references extracted from $v_1, \ldots, v_{n-1}$, meaning each subsequent shot benefits from progressively more diverse reference images. However, due to the anchor strategy, character references are always drawn from early shots to maintain appearance fidelity.
 
-Algorithm 1 presents the full agentic pipeline. The loop processes shots sequentially, maintaining the Entity Registry state between shots. Note the strict temporal ordering: *generate* $v_n$ → *ground* $v_n$ → *update registry* → *generate* $v_{n+1}$. Grounding always happens after generation, never before, which is the key structural property enabling the system to bootstrap from nothing on shot 1.
+% ----------------------------------------------------------------------------
+\subsection{Agentic Orchestration Loop}
 
-```
-Algorithm 1: T2V-Grounding Agentic Pipeline
+Algorithm~\ref{alg:pipeline} presents the full agentic pipeline. The loop processes shots sequentially, maintaining the Entity Registry state between shots. Note the strict temporal ordering: \emph{generate} $v_n$ $\rightarrow$ \emph{ground} $v_n$ $\rightarrow$ \emph{update registry} $\rightarrow$ \emph{generate} $v_{n+1}$.
 
-Input:  Script S = {s_1, ..., s_N}
-Output: Videos V = {v_1, ..., v_N}
+\begin{algorithm}[t]
+\caption{T2V-Grounding Agentic Pipeline}
+\label{alg:pipeline}
+\begin{algorithmic}[1]
+\REQUIRE Script $\mathcal{S} = \{s_1, \ldots, s_N\}$, optional $\mathcal{C}_{\text{global}}$
+\ENSURE Videos $\mathcal{V} = \{v_1, \ldots, v_N\}$
+\STATE Initialize: Registry $\mathcal{R} = \emptyset$, Known entities $\mathcal{K} = \emptyset$
+\IF{$\mathcal{C}_{\text{global}} \neq \emptyset$}
+    \STATE $\mathcal{K} \leftarrow \text{LLM\_Parse}(\mathcal{C}_{\text{global}}, \text{shot\_id}=0)$
+    \STATE $\mathcal{G} \leftarrow \text{ExtractGlobalContext}(\mathcal{C}_{\text{global}})$
+\ENDIF
+\FOR{$n = 1, 2, \ldots, N$}
+    \STATE $\mathcal{E}_n \leftarrow \text{LLM\_Parse}(s_n, \mathcal{K})$
+    \STATE $\mathcal{K} \leftarrow \mathcal{K} \cup \{e \in \mathcal{E}_n : e.\text{is\_new}\}$
+    \STATE $\text{prompt}_n \leftarrow \text{BuildPrompt}(\mathcal{G}, \mathcal{E}_n, s_n)$ \COMMENT{3-layer}
+    \STATE $\text{shot\_type} \leftarrow \text{DetectShotType}(s_n)$ \COMMENT{close-up/wide/medium}
+    \STATE $\text{seed}_n \leftarrow \text{seed}_{\text{base}} + n$ \COMMENT{per-shot seed increment}
+    \STATE \COMMENT{Retrieve refs with anchor strategy (earliest high-quality)}
+    \STATE $\mathcal{I}_{\text{char}} \leftarrow \mathcal{R}.\text{query\_anchor}(\mathcal{E}_n^{\text{char}}, \tau_q=0.5)$
+    \STATE $\mathcal{I}_{\text{obj}} \leftarrow \mathcal{R}.\text{query}(\mathcal{E}_n^{\text{obj}}, k=1, \tau_q=0.4, \text{earliest})$
+    \IF{$\text{shot\_type} \neq \text{close-up}$}
+        \STATE $\mathcal{I}_{\text{loc}} \leftarrow \mathcal{R}.\text{query}(\mathcal{E}_n^{\text{loc}}, k=1, \tau_q=0.3, \text{earliest})$
+    \ENDIF
+    \STATE $\mathcal{I}_n \leftarrow \text{FilterByMaxRefs}(\mathcal{I}_{\text{char}} \cup \mathcal{I}_{\text{obj}} \cup \mathcal{I}_{\text{loc}}, \text{shot\_type})$
+    \IF{$\mathcal{I}_n \neq \emptyset$}
+        \STATE $v_n \leftarrow \mathcal{G}_{\text{S2V}}(\text{prompt}_n, \mathcal{I}_n, \text{seed}_n)$
+    \ELSE
+        \STATE $v_n \leftarrow \mathcal{G}_{\text{T2V}}(\text{prompt}_n, \text{seed}_n)$
+    \ENDIF
+    \STATE $\mathcal{F}_n \leftarrow \text{ExtractFrames}(v_n, \text{fps}=1)$
+    \STATE \COMMENT{Ground all entities, then cross-entity IoU dedup}
+    \STATE $\mathcal{D}_{\text{all}} \leftarrow \emptyset$
+    \FOR{each $e \in \mathcal{E}_n$ with priority $\neq$ low}
+        \IF{$e.\text{type} = \texttt{location}$}
+            \STATE $\mathcal{D}_{\text{all}}[e] \leftarrow$ BackgroundInpaint$(\mathcal{F}_n)$
+        \ELSE
+            \STATE $\mathcal{D}_{\text{all}}[e] \leftarrow$ GDINO+SAM2$(\mathcal{F}_n, e.\text{text\_desc})$
+        \ENDIF
+    \ENDFOR
+    \STATE $\mathcal{D}_{\text{dedup}} \leftarrow \text{CrossEntityIoUDedup}(\mathcal{D}_{\text{all}}, \tau_{\text{IoU}}=0.5)$
+    \FOR{each $e \in \mathcal{E}_n$ with priority $\neq$ low}
+        \STATE scored $\leftarrow$ QualityScore$(\mathcal{D}_{\text{dedup}}[e], e.\text{type})$
+        \FOR{$c \in \text{TopK}(\text{scored}, K_{\text{max}})$ with $q(c) \geq \tau_q$}
+            \STATE $\mathcal{R}.\text{register}(e.\text{entity\_id}, c)$
+        \ENDFOR
+    \ENDFOR
+    \STATE $\mathcal{V}[n] \leftarrow v_n$
+\ENDFOR
+\RETURN $\mathcal{V}$
+\end{algorithmic}
+\end{algorithm}
 
-Initialize: Registry R = ∅, Known entities K = ∅
+% ============================================================================
+\section{Experiments}
 
-for n = 1, 2, ..., N do
-  // Step 1: Parse entities with coreference
-  E_n = LLM_Parse(s_n, K)
-  K ← K ∪ {e ∈ E_n : e.is_new}
+Omit for now.
 
-  // Step 2: Retrieve references and route generation
-  I_n = R.query(E_n, k=1, τ_q=0.4)
-  if I_n ≠ ∅ then
-    v_n = G_S2V(s_n, I_n)       // Appearance-conditioned
-  else
-    v_n = G_T2V(s_n)            // Pure text-to-video
+% ============================================================================
+\section{Discussion}
 
-  // Step 3: Post-generation grounding
-  F_n = ExtractFrames(v_n, fps=1)
-  for each entity e ∈ E_n with priority ≠ low do
-    crops = GroundingDINO+SAM2(F_n, e.text_description)
-    scored_crops = QualityScore(crops, e.type)
-    for c ∈ TopK(scored_crops, K_max) with q(c) ≥ τ_q do
-      R.register(e.entity_id, c)
+Omit for now.
 
-  V[n] = v_n
-end for
-return V
-```
+% ============================================================================
+\section{Conclusion}
 
-### 3.7 Multi-GPU Distributed Inference
+Omit for now.
 
-The S2V and T2V generation models contain 14B parameters each. We distribute inference using Ulysses Sequence Parallelism (USP) across $P$ GPUs, which splits the sequence dimension of the diffusion transformer's attention computation. With $P=4$ GPUs, this yields approximately 3× speedup over single-GPU inference.
-
-The orchestration logic (entity parsing, grounding, registry updates) runs exclusively on rank 0, while all ranks participate in video generation. After video generation, rank 0 saves the video and performs grounding; other ranks wait at a barrier before the next shot begins.
-
----
-
-## 4. Experiments
-
-### 4.1 Setup
-
-**Benchmarks.** We evaluate on three multi-shot scripts of increasing difficulty:
-- **SingleChar-4shot**: 4 shots, single character (Alex) across varied scenes (indoors → outdoors → rain).
-- **DualChar-5shot**: 5 shots, two characters (Maya and Leo) with introduction at different shots.
-- **Stress-6shot**: 6 shots, single character under extreme lighting/weather variations.
-
-**Metrics.**
-- **CLIP-I**: Mean cosine similarity between CLIP image features of reference crops and generated frames for the corresponding entity.
-- **FaceID**: Mean cosine similarity between InsightFace embeddings of reference crops and generated frames (for character entities only).
-- **CLIP-T**: Mean CLIP text-image similarity between the shot description and generated frames (text alignment quality).
-- **FVD**: Fréchet Video Distance on generated videos (video quality).
-
-**Baselines.**
-- **T2V-Only**: Direct generation with Wan2.1-T2V-14B for all shots. No reference conditioning.
-- **I2V-Repeat**: Use the first frame of $v_1$ as conditioning for all subsequent shots via Wan-I2V.
-- **Manual-Ref**: Upper bound; human-selected reference images provided for all shots.
-
-**Implementation Details.** All experiments use Wan2.1-T2V-14B for T2V mode and Phantom-Wan-14B for S2V mode. Generation resolution is 832×480 at 81 frames (≈3.4s at 24fps). Grounding DINO uses SwinB backbone; SAM2 uses Hiera-Large. All experiments run on 4× NVIDIA A100 80GB GPUs.
-
-### 4.2 Main Results
-
-| Method | CLIP-I ↑ | FaceID ↑ | CLIP-T ↑ | FVD ↓ |
-|--------|-----------|----------|----------|-------|
-| T2V-Only | 0.421 | 0.312 | **0.281** | 412 |
-| I2V-Repeat | 0.539 | 0.498 | 0.243 | 531 |
-| **T2V-Grounding (Ours)** | **0.601** | **0.533** | 0.274 | **398** |
-| Manual-Ref (Upper Bound) | 0.648 | 0.581 | 0.279 | 381 |
-
-*Table 1: Comparison on SingleChar-4shot. Results averaged over 3 random seeds.*
-
-Our method improves over T2V-Only by +0.18 CLIP-I and +0.22 FaceID, demonstrating effective cross-shot appearance conditioning. Compared to I2V-Repeat, our method is significantly better on both consistency metrics while also preserving higher text alignment (CLIP-T), since we do not lock the first-frame composition. The gap between our method and Manual-Ref is modest, suggesting that automatically extracted grounding crops are near-equivalent to human-curated references.
-
-### 4.3 Ablation Studies
-
-**Effect of Grounding Quality Threshold.** We vary $\tau_q \in \{0.2, 0.4, 0.6\}$. A too-low threshold (0.2) introduces noisy references (back-of-head crops, occluded views) that hurt consistency. A too-high threshold (0.6) is overly selective, sometimes providing no references at all and falling back to T2V mode. We find $\tau_q = 0.4$ provides the best balance.
-
-**Post-Generation vs. Pre-Generation Grounding.** We compare our post-generation approach against a variant that bootstraps references using a T2I model (SDXL) before generating any video. The T2I baseline shows lower CLIP-I (0.561 vs. 0.601) due to cross-model style inconsistency between the T2I-generated references and the T2V backbone's rendering style.
-
-**S2V vs. I2V for Reference Conditioning.** Replacing Phantom S2V with Wan-I2V for Shot 2+ gives CLIP-T = 0.234 (vs. 0.274 for Phantom), confirming that I2V's composition lock-in hurts semantic alignment with the shot description.
-
-**Number of Reference Images.** Using 1 reference per entity (ours) vs. up to 3 references: Using 3 references gives marginal improvement in CLIP-I (+0.008) but also introduces more visual noise in diverse shots, with higher variance. We default to 1 reference per entity for simplicity.
-
-### 4.4 Qualitative Results
-
-Figure 2 shows the 4-shot SingleChar sequence. With T2V-Only, the character's face, hair color, and clothing change noticeably between shots. With T2V-Grounding, the character maintains consistent appearance across varied scenes (police station, office, market, rainy night), even under dramatic lighting changes. Importantly, the character's pose and camera angle change freely across shots, which would not be possible with an I2V approach.
-
-### 4.5 Multi-Character Consistency
-
-Table 2 shows results on DualChar-5shot. Our method handles two characters simultaneously by maintaining separate registry entries per entity. Each character is independently grounded and referenced. Shots 1-2 use T2V to establish each character's appearance; Shots 3-5 use S2V with per-character references. Both characters maintain strong identity consistency without confusing their reference images.
-
----
-
-## 5. Discussion
-
-**Limitations.**
-1. The pipeline runs shots sequentially; parallel generation of independent shots is not supported.
-2. Grounding DINO may fail for fine-grained entity descriptions or heavily occluded characters; in such cases, the system falls back to T2V mode.
-3. For shot 1, no reference conditioning is possible, setting a ceiling on first-shot character uniqueness. Bootstrapping from a T2I reference could partially address this, at the cost of cross-model style inconsistency.
-4. The pipeline currently uses the most recent shot's grounding as references; a multi-shot aggregation strategy may yield more robust references.
-
-**Broader Impact.** This work enables automated multi-shot video generation for content creation, game prototyping, and filmmaking assistance. As with all generative AI, there is potential for misuse in creating non-consensual character likenesses. The method requires explicit text descriptions specifying character appearance, which provides some transparency about the generation intent.
-
----
-
-## 6. Conclusion
-
-We presented T2V-Grounding, a training-free agentic framework for consistent multi-shot text-to-video generation. The core insight—extracting visual references from generated videos via post-generation grounding and feeding them back to condition subsequent shots—creates a self-reinforcing consistency loop that requires no external reference images, no model fine-tuning, and generalizes to arbitrary scripts. Our LLM-driven entity parser handles cross-shot coreference automatically, and our quality-aware reference selection ensures only reliable crops enter the conditioning pipeline. We believe the post-generation grounding paradigm opens a new direction for self-consistent agentic video generation, and hope this work inspires further exploration of closed-loop generation-perception systems.
-
----
-
-## References
-
-> TODO: fill in BibTeX entries for:
-> Wan2.1, Phantom, GroundingDINO, SAM2, InsightFace, CLIP, CogVideoX, IP-Adapter,
-> AnimateDiff, DreamBooth-Video, DreamVideo, StoryMaker, ConsistentStory, TheaterGen,
-> Deepspeed-Ulysses, FVD, VideoCrafter2, KLING, Gen-3, Sora
-
----
-
-## Checklist (作者自查)
-
-- [ ] 实验数据为 placeholder，需替换为真实结果
-- [ ] Figure 1（系统架构图）待制作
-- [ ] Figure 2（定性对比图，4-shot 视频截图网格）待制作
-- [ ] Table 2（DualChar-5shot 结果）待补充
-- [ ] Algorithm 1 转为 LaTeX `algorithm2e` 环境
-- [ ] 所有 `[cite]` 填入真实 BibTeX key
-- [ ] 投稿前去除内部模型名称（`qmt` 等），替换为匿名描述
-- [ ] 检查 CVPR 页数限制（正文 8 页 + 参考文献）
+\end{document}

@@ -90,19 +90,34 @@ class EntityRegistry:
         entity_id: str,
         top_k: int = 3,
         min_quality: float = 0.3,
-        prefer_recent: bool = True,
+        anchor_strategy: str = "earliest_good",
     ) -> List[ReferenceEntry]:
         """
         查询某实体的最优参考帧
 
         Args:
-            entity_id:     实体 ID
-            top_k:         返回条数
-            min_quality:   最低质量分过滤
-            prefer_recent: True=按 shot_id 降序（最近优先），False=按质量降序
+            entity_id:        实体 ID
+            top_k:            返回条数
+            min_quality:      最低质量分过滤
+            anchor_strategy:  选择策略
+                - "earliest_good": 【推荐】优先最早出现的高质量参考图，防止误差累积
+                - "best_quality":  纯按质量排序（可能选到后面已偏移的 shot）
+                - "most_recent":   最近优先（旧逻辑，会导致误差累积）
+
+        Returns:
+            按策略排序的参考图列表
         """
         conn = sqlite3.connect(self.db_path)
-        order = "shot_id DESC, quality_score DESC" if prefer_recent else "quality_score DESC"
+
+        if anchor_strategy == "earliest_good":
+            # 核心策略：优先最早 shot，同 shot 内按质量排序
+            # 这样可以锚定最初的高质量参考，避免误差累积
+            order = "shot_id ASC, quality_score DESC"
+        elif anchor_strategy == "best_quality":
+            order = "quality_score DESC, shot_id ASC"
+        else:  # most_recent (旧逻辑，保留兼容性)
+            order = "shot_id DESC, quality_score DESC"
+
         rows = conn.execute(f"""
             SELECT entity_id, shot_id, frame_path, crop_path, quality_score, source, created_at
             FROM ref_entries
@@ -113,6 +128,44 @@ class EntityRegistry:
         conn.close()
 
         return [ReferenceEntry(*row) for row in rows]
+
+    def query_anchor(
+        self,
+        entity_id: str,
+        min_quality: float = 0.5,
+    ) -> Optional[ReferenceEntry]:
+        """
+        获取实体的"锚点"参考图：最早出现的高质量参考
+
+        这是防止误差累积的核心方法：
+        - 优先选择最早 shot（shot_id 最小）
+        - 在最早 shot 中选质量最高的
+        - 如果最早 shot 质量不达标，才考虑后续 shot
+
+        Args:
+            entity_id:    实体 ID
+            min_quality:  锚点要求的最低质量（应该比普通查询更严格）
+
+        Returns:
+            最佳锚点参考图，或 None
+        """
+        conn = sqlite3.connect(self.db_path)
+
+        # 策略：先找最早 shot 中质量最高的
+        # 如果最早 shot 没有达标的，再找所有 shot 中质量最高的
+        row = conn.execute("""
+            SELECT entity_id, shot_id, frame_path, crop_path, quality_score, source, created_at
+            FROM ref_entries
+            WHERE entity_id = ? AND quality_score >= ?
+            ORDER BY shot_id ASC, quality_score DESC
+            LIMIT 1
+        """, (entity_id, min_quality)).fetchone()
+
+        conn.close()
+
+        if row:
+            return ReferenceEntry(*row)
+        return None
 
     def has_references(self, entity_id: str) -> bool:
         """检查某实体是否有历史参考"""
