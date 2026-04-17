@@ -314,6 +314,30 @@ class EntityRegistry:
         conn.close()
         return [r[0] for r in rows]
 
+    def get_registered_foreground_entities(self, exclude_types: List[str] = None) -> List[str]:
+        """
+        获取已注册的前景实体 ID 列表（用于 location grounding 时排除）
+
+        Args:
+            exclude_types: 要排除的实体类型前缀列表，默认 ["loc_"]
+                           因为 entity_id 格式为 char_xxx / obj_xxx / loc_xxx
+
+        Returns:
+            非 location 类型的已注册实体 ID 列表
+        """
+        if exclude_types is None:
+            exclude_types = ["loc_"]
+
+        all_entities = self.get_all_entities()
+        foreground_entities = []
+
+        for entity_id in all_entities:
+            is_excluded = any(entity_id.startswith(prefix) for prefix in exclude_types)
+            if not is_excluded:
+                foreground_entities.append(entity_id)
+
+        return foreground_entities
+
     def stats(self) -> dict:
         """返回 registry 统计信息"""
         conn = sqlite3.connect(self.db_path)

@@ -303,6 +303,16 @@ This ensures that each detected region is assigned to at most one entity---the o
 \end{enumerate}
 This inpainted background serves as the location reference for subsequent shots, ensuring scene consistency without character contamination.
 
+\textbf{Registry-Aware Foreground Removal.} A limitation of naive background extraction is that it relies on generic detection prompts (``person'', ``object''), which may fail to detect specific foreground entities that have been registered in earlier shots. For example, a ``white woven bassinet'' registered in Shot~2 may not be detected by generic prompts when extracting the background for Shot~3, leaving visual artifacts in the location reference.
+
+To address this, we introduce \textbf{registry-aware foreground removal}: before extracting a location background, we query the Entity Registry for all registered non-location entities and augment the detection prompt with their text descriptions:
+\begin{equation}
+\mathcal{P}_{\text{fg}} = \mathcal{P}_{\text{base}} \cup \{e.\text{desc} : e \in \mathcal{R}, e.\text{type} \neq \text{location}\}
+\end{equation}
+where $\mathcal{P}_{\text{base}} = \{\text{``person'', ``people'', ``man'', ``woman'', ``baby'', ``child'', ``object''}\}$ are generic foreground terms.
+
+This ensures that \emph{all previously registered entities}---including specific objects like bassinets, weapons, or vehicles---are detected and removed from the background, producing cleaner location references that do not contaminate subsequent shots with residual foreground elements.
+
 % ----------------------------------------------------------------------------
 \subsection{Reference Quality Scoring}
 

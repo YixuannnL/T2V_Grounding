@@ -163,6 +163,7 @@ class VideoGrounder:
         output_dir: str,
         max_results: int = 5,
         entity_type: str = "character",
+        registered_fg_descriptions: List[str] = None,
     ) -> List[GroundingResult]:
         """
         在给定帧列表中检测实体，返回检测结果（按置信度降序）
@@ -175,6 +176,8 @@ class VideoGrounder:
             max_results:  最多返回几个结果
             entity_type:  实体类型（character/object/location/style）
                           location 类型跳过 SAM2，直接保存完整帧
+            registered_fg_descriptions: 数据库中已注册的前景实体描述列表
+                                        仅用于 location 类型，提取背景时移除这些实体
         """
         self._load_gdino()
         # location 需要 SAM2 来抠前景
@@ -192,7 +195,9 @@ class VideoGrounder:
             if entity_type == "location":
                 frame_stem = Path(frame_path).stem
                 crop_path = os.path.join(output_dir, f"{entity_id}_{frame_stem}_det00_crop.jpg")
-                bg_img = self._extract_background(image_source, image_tensor)
+                bg_img = self._extract_background(
+                    image_source, image_tensor, registered_fg_descriptions
+                )
                 cv2.imwrite(crop_path, cv2.cvtColor(bg_img, cv2.COLOR_RGB2BGR))
                 h, w = image_source.shape[:2]
                 results.append(GroundingResult(
@@ -286,7 +291,12 @@ class VideoGrounder:
             print(f"[Grounder] SAM2 分割失败: {e}，使用直接裁切")
             return None
 
-    def _extract_background(self, image_rgb: np.ndarray, image_tensor) -> np.ndarray:
+    def _extract_background(
+        self,
+        image_rgb: np.ndarray,
+        image_tensor,
+        registered_fg_descriptions: List[str] = None,
+    ) -> np.ndarray:
         """
         检测帧中所有前景人物/物体，用 SAM2 得到 union mask，
         再用 cv2.inpaint 填充前景区域，返回干净的背景帧。
@@ -294,14 +304,28 @@ class VideoGrounder:
         Args:
             image_rgb:    原始帧（numpy RGB）
             image_tensor: 已由 load_image 生成的 DINO 输入 tensor
+            registered_fg_descriptions: 数据库中已注册的前景实体描述列表
+                                        这些实体在提取背景时需要被移除
         """
         from groundingdino.util.inference import predict
 
-        # 用宽泛的前景 prompt 检测所有人物/物体
+        # 构建前景检测 prompt
+        # 基础 prompt（通用的人物/物体检测词）
+        base_prompts = ["person", "people", "man", "woman", "baby", "child", "object", "bag", "item"]
+
+        # 添加数据库中已注册的前景实体描述
+        # 这样可以更精准地检测并移除特定物体（如 bassinet）
+        if registered_fg_descriptions:
+            base_prompts.extend(registered_fg_descriptions)
+            print(f"[Grounder] Location background extraction: "
+                  f"removing {len(registered_fg_descriptions)} registered foreground entities")
+
+        caption = " . ".join(base_prompts)
+
         boxes, logits, _ = predict(
             model=self._gdino_model,
             image=image_tensor,
-            caption="person . people . man . woman . object . bag . item",
+            caption=caption,
             box_threshold=0.30,
             text_threshold=0.25,
         )

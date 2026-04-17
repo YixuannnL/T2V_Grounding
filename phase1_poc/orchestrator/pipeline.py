@@ -781,6 +781,19 @@ class T2VGroundingPipeline:
         # ── Step 1: 先对所有实体做 grounding ──────────────────────────────────
         all_ground_results = {}  # entity_id -> [GroundingResult, ...]
 
+        # 获取已注册的前景实体描述（用于 location grounding 时排除）
+        # 这样在提取 location 背景时，可以把 bassinet 等已注册物体也移除掉
+        registered_fg_entity_ids = self.registry.get_registered_foreground_entities()
+        registered_fg_descriptions = []
+        for fg_eid in registered_fg_entity_ids:
+            fg_entity = self.parser._get_entity(fg_eid)
+            if fg_entity and fg_entity.text_description:
+                # 使用实体的文本描述作为 grounding prompt
+                registered_fg_descriptions.append(fg_entity.text_description)
+        if registered_fg_descriptions:
+            print(f"[Pipeline] Location grounding 将移除 {len(registered_fg_descriptions)} 个"
+                  f"已注册前景实体: {registered_fg_entity_ids}")
+
         for entity in parse_result.entities:
             # 跳过低优先级实体
             if entity.grounding_priority == "low":
@@ -791,6 +804,8 @@ class T2VGroundingPipeline:
                 continue
 
             # Grounding DINO 定位
+            # 对于 location 类型，传入已注册的前景实体描述，以便提取更干净的背景
+            fg_descs_for_loc = registered_fg_descriptions if entity.type == "location" else None
             ground_results = self.grounder.ground_in_frames(
                 frame_paths=frames,
                 entity_text=entity.text_description,
@@ -798,6 +813,7 @@ class T2VGroundingPipeline:
                 output_dir=crops_dir,
                 max_results=5,
                 entity_type=entity.type,
+                registered_fg_descriptions=fg_descs_for_loc,
             )
             if ground_results:
                 all_ground_results[entity.entity_id] = ground_results

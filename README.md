@@ -619,6 +619,41 @@ if entity_type == "location":
     bg_img = self._extract_background(image_source, image_tensor)
 ```
 
+**Registry-Aware 前景移除（v2.2 新增）**：
+
+传统的背景提取只使用通用词（person, people, object）来检测前景。但当场景中存在特定物体（如 bassinet 婴儿篮）时，这些通用词可能无法覆盖，导致 location crop 中残留前景物体。
+
+**问题示例**：
+```
+Shot 2: 婴儿篮 (obj_bassinet) 被注册到 Registry
+Shot 3: 提取 loc_pine_forest 背景时，bassinet 没有被移除
+       → location crop 中包含了 bassinet 的残影
+```
+
+**解决方案**：在提取 location 背景时，动态查询 Registry 中已注册的所有非 location 实体，将它们的 text_description 添加到前景检测 prompt 中：
+
+```python
+# 获取已注册的前景实体描述
+registered_fg_ids = registry.get_registered_foreground_entities()  # 排除 loc_ 前缀
+fg_descriptions = [parser.get_entity(eid).text_description for eid in registered_fg_ids]
+
+# 构建增强的前景检测 prompt
+base_prompts = ["person", "people", "man", "woman", "baby", "child", "object"]
+base_prompts.extend(fg_descriptions)  # 添加 "white woven bassinet", "newborn baby" 等
+caption = " . ".join(base_prompts)
+
+# Grounding DINO 现在能检测到 bassinet 并将其移除
+boxes, logits, _ = predict(model, image, caption=caption, ...)
+```
+
+**效果**：
+```
+[Pipeline] Location grounding 将移除 3 个已注册前景实体: ['char_man', 'char_newborn_baby', 'obj_bassinet']
+[Grounder] Location background extraction: removing 3 registered foreground entities
+```
+
+这确保了 location crop 是真正干净的背景，不包含任何已知的前景实体。
+
 #### Step 4：Re-ID 质量评分
 
 **文件**：`visual_grounding/reid.py`
