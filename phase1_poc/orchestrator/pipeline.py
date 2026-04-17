@@ -87,6 +87,7 @@ class T2VGroundingPipeline:
         grounding_threshold: float = 0.35,
         min_ref_quality: float = 0.4,
         high_quality_threshold: float = 0.85,  # 高质量正脸阈值，用于锚点选择
+        min_face_confidence: float = 0.3,      # 最低人脸置信度，低于此值视为"无脸参考"
         max_refs_per_entity: int = 3,
         wan2_t2v_dir: str = "weights/Wan2.1-T2V-14B",
         phantom_ckpt: str = "weights/Phantom",
@@ -120,6 +121,7 @@ class T2VGroundingPipeline:
         self.mock_mode = (gen_backend == "mock")
         self.min_ref_quality = min_ref_quality
         self.high_quality_threshold = high_quality_threshold
+        self.min_face_confidence = min_face_confidence  # 人脸置信度阈值
         self.max_refs_per_entity = max_refs_per_entity
 
         # Shot 1 验证参数
@@ -309,6 +311,12 @@ class T2VGroundingPipeline:
             # ── 关键改动：使用锚点策略，防止误差累积 ──────────────────────────
             # 对于 character，优先使用"最早的大正脸"参考图（锚点）
             # 策略：高质量正脸 > 早期出现，但同等高质量选更早的
+            #
+            # 【v2.3 新增】Frontal-Aware 检查：
+            # 如果 character 的锚点参考是背影/侧面（id_confidence < min_face_confidence），
+            # 则不使用这个参考图，改为在 prompt 中注入外观描述（Appearance Context）
+            faceless_characters = []  # 记录无脸参考的 character，后续构建 Appearance Context
+
             for entity in sorted_non_loc[:max_non_loc_refs]:
                 # character 使用锚点查询：优先选择高质量正脸
                 if entity.type == "character":
@@ -318,10 +326,20 @@ class T2VGroundingPipeline:
                         high_quality_threshold=self.high_quality_threshold,
                     )
                     if anchor:
-                        reference_used[entity.entity_id] = [anchor.crop_path]
-                        all_ref_paths.append(anchor.crop_path)
-                        print(f"[Pipeline] {entity.entity_id}: 使用锚点参考图 "
-                              f"(shot={anchor.shot_id}, score={anchor.quality_score:.2f})")
+                        # 【v2.3】检查 id_confidence：如果太低，说明是背影/侧面
+                        if anchor.id_confidence < self.min_face_confidence:
+                            # 无脸参考：不传参考图，后续通过 Appearance Context 描述外观
+                            faceless_characters.append(entity)
+                            print(f"[Pipeline] {entity.entity_id}: 锚点为无脸参考 "
+                                  f"(id_conf={anchor.id_confidence:.2f} < {self.min_face_confidence})"
+                                  f"，跳过参考图，将使用 Appearance Context")
+                        else:
+                            # 有脸参考：正常使用
+                            reference_used[entity.entity_id] = [anchor.crop_path]
+                            all_ref_paths.append(anchor.crop_path)
+                            print(f"[Pipeline] {entity.entity_id}: 使用锚点参考图 "
+                                  f"(shot={anchor.shot_id}, score={anchor.quality_score:.2f}, "
+                                  f"id_conf={anchor.id_confidence:.2f})")
                 else:
                     # object 等其他类型用普通查询
                     refs = self.registry.query(
@@ -357,11 +375,20 @@ class T2VGroundingPipeline:
             #       人物外观锚定，可能生成动画风格视频
             # 解决：只有当有 subject（character/object）ref 时才用 S2V，
             #       否则回退 T2V + prompt 强化环境描述
+            #
+            # 【v2.3 改进】"有效的 subject ref" 定义：
+            #   - character: 必须有脸（不在 faceless_characters 中）
+            #   - object: 正常计入
+            #   - 无脸 character 不计入有效 subject ref
             has_subject_ref = any(
                 e.entity_id in reference_used
                 for e in non_location_entities
+                if e not in faceless_characters  # 排除无脸 character
             )
-            num_subject_refs = len([e for e in non_location_entities if e.entity_id in reference_used])
+            num_subject_refs = len([
+                e for e in non_location_entities
+                if e.entity_id in reference_used and e not in faceless_characters
+            ])
             num_location_refs = len([e for e in location_entities if e.entity_id in reference_used])
 
             if self.mock_mode:
@@ -370,15 +397,21 @@ class T2VGroundingPipeline:
                 # 有 subject ref → S2V，外观有锚定
                 generation_mode = "phantom"
             else:
-                # 无 subject ref（可能只有 location ref）→ T2V + prompt 强化
+                # 无 subject ref（可能只有 location ref 或只有无脸 character）→ T2V + prompt 强化
                 generation_mode = "t2v"
-                if num_location_refs > 0:
-                    print(f"[Pipeline] ⚠️  无 subject 参考图，仅有 location ref，回退 T2V 避免风格漂移")
+                if num_location_refs > 0 or faceless_characters:
+                    reason_parts = []
+                    if not has_subject_ref:
+                        reason_parts.append("无有效 subject 参考图")
+                    if faceless_characters:
+                        reason_parts.append(f"{len(faceless_characters)} 个无脸 character")
+                    print(f"[Pipeline] ⚠️  {', '.join(reason_parts)}，回退 T2V 避免风格漂移")
                     # 清空 all_ref_paths，T2V 不传参考图
                     all_ref_paths = []
 
             print(f"[Pipeline] 模式: {generation_mode} | 参考图: {len(all_ref_paths)} 张 "
-                  f"(subject: {num_subject_refs}, location: {num_location_refs})")
+                  f"(有效 subject: {num_subject_refs}, location: {num_location_refs}, "
+                  f"无脸 character: {len(faceless_characters)})")
 
             # ── 构建生成 prompt ────────────────────────────────────────────────
             # Prompt 分层：
@@ -423,6 +456,39 @@ class T2VGroundingPipeline:
                     env_context = "[Environment Context]\n" + "\n".join(f"Scene: {d}." for d in env_desc_parts)
                     prompt_parts.append(env_context)
                     print(f"[Pipeline] Environment context (T2V fallback):\n{env_context}")
+
+            # Layer 2.6【v2.3 新增】: 无脸 character 的外观描述（Appearance Context）
+            # 当 character 只有背影参考（无脸）时，通过 prompt 详细描述其外观
+            # 这样 T2V 生成时可以保持衣服、发型等外观一致性
+            if faceless_characters:
+                appearance_parts = []
+                for fc_entity in faceless_characters:
+                    known = self.parser._get_entity(fc_entity.entity_id)
+                    source = known if known else fc_entity
+                    desc = source.text_description.strip()
+                    if source.attributes:
+                        # 筛选外观相关属性
+                        appearance_attrs = {}
+                        appearance_keys = [
+                            "hair_color", "hair_style", "clothing", "gender",
+                            "age", "build", "skin_tone", "distinctive_features",
+                            "outfit", "accessories", "appearance"
+                        ]
+                        for k, v in source.attributes.items():
+                            if v and any(ak in k.lower() for ak in appearance_keys):
+                                appearance_attrs[k] = v
+                        if appearance_attrs:
+                            attr_items = [f"{k}: {v}" for k, v in appearance_attrs.items()]
+                            desc = f"{desc} ({', '.join(attr_items)})"
+                    appearance_parts.append(f"Character: {desc}.")
+                if appearance_parts:
+                    appearance_context = (
+                        "[Appearance Context - No Frontal Reference Available]\n"
+                        + "\n".join(appearance_parts)
+                        + "\nNote: Maintain visual consistency with the described appearance."
+                    )
+                    prompt_parts.append(appearance_context)
+                    print(f"[Pipeline] Appearance context (无脸 character):\n{appearance_context}")
 
             # Layer 3: 当前 shot 的实体描述
             shot_context = self.parser.build_shot_context(parse_result)
@@ -862,6 +928,8 @@ class T2VGroundingPipeline:
             os.makedirs(selected_dir, exist_ok=True)
             registered_paths = []
             for s in good[:self.max_refs_per_entity]:
+                # 获取 id_confidence（仅 character 类型有意义，其他类型默认 1.0）
+                id_conf = s.id_confidence if entity.type == "character" else 1.0
                 entry = ReferenceEntry(
                     entity_id=entity.entity_id,
                     shot_id=shot_id,
@@ -869,6 +937,7 @@ class T2VGroundingPipeline:
                     crop_path=s.crop_path,
                     quality_score=float(s.final_score),
                     source="grounding",
+                    id_confidence=float(id_conf),
                 )
                 self.registry.register(entity.entity_id, entry)
                 registered_paths.append(s.crop_path)

@@ -190,6 +190,46 @@ Scene: Interrogation room (lighting: fluorescent, harsh shadows, atmosphere: ten
 
 **解决方案**：对于 character 类型实体，使用 **"earliest_high_quality"** 策略选择锚点参考图——优先选择"最早的大正脸"，而非单纯选最早 shot。
 
+**Frontal-Aware Character Reference（v2.3 新增）**：
+
+观察发现：当 character 的锚点参考图是**背影或完全侧面**（id_confidence < 0.3）时，Phantom 模型无法从中提取面部特征，会"脑补"一个不一致的脸，甚至变成动画风格。
+
+**解决方案**：增加 `id_confidence` 检查，区分"有脸参考"和"无脸参考"：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  Character Reference Selection                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  对于每个 character entity，查询锚点的 id_confidence：          │
+│                                                                 │
+│  id_confidence >= 0.3 ──► "有脸参考" ──► 正常传参考图           │
+│                                                                 │
+│  id_confidence < 0.3  ──► "无脸参考" ──► 跳过参考图             │
+│                          │                                      │
+│                          └──► 注入 [Appearance Context] prompt  │
+│                               包含：hair_color, clothing, etc.  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Appearance Context 示例**：
+```
+[Appearance Context - No Frontal Reference Available]
+Character: blonde woman (hair_color: blonde, clothing: white coat).
+Note: Maintain visual consistency with the described appearance.
+```
+
+**生成模式决策更新**：
+- 有"有脸 character"或 object 参考 → S2V
+- 只有"无脸 character"→ T2V + Appearance Context（通过 prompt 描述外观）
+- 只有 location 参考 → T2V + Environment Context
+
+这确保了：
+1. 避免 Phantom 用背影"脑补"面部导致动画化
+2. 衣服、发型等外观信息通过 prompt 传递
+3. 当后续 shot 出现正脸时，才开始使用 S2V
+
 **策略细节**：
 ```
 ┌─────────────────────────────────────────────────────────────────┐

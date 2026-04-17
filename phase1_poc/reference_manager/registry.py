@@ -21,6 +21,7 @@ class ReferenceEntry:
     quality_score: float      # 综合质量分
     source: str               # "grounding" | "bootstrapped" | "manual"
     created_at: str = ""
+    id_confidence: float = 1.0  # 人脸检测置信度（仅 character 有意义，其他类型默认 1.0）
 
     def __post_init__(self):
         if not self.created_at:
@@ -52,10 +53,16 @@ class EntityRegistry:
                 crop_path   TEXT NOT NULL,
                 quality_score REAL NOT NULL,
                 source      TEXT NOT NULL,
-                created_at  TEXT NOT NULL
+                created_at  TEXT NOT NULL,
+                id_confidence REAL DEFAULT 1.0
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_entity ON ref_entries(entity_id)")
+        # 兼容旧数据库：如果 id_confidence 列不存在，添加它
+        try:
+            conn.execute("ALTER TABLE ref_entries ADD COLUMN id_confidence REAL DEFAULT 1.0")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
         conn.commit()
         conn.close()
 
@@ -65,8 +72,8 @@ class EntityRegistry:
         conn = sqlite3.connect(self.db_path)
         conn.execute("""
             INSERT INTO ref_entries
-            (entity_id, shot_id, frame_path, crop_path, quality_score, source, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            (entity_id, shot_id, frame_path, crop_path, quality_score, source, created_at, id_confidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             entity_id,
             entry.shot_id,
@@ -75,10 +82,11 @@ class EntityRegistry:
             entry.quality_score,
             entry.source,
             entry.created_at,
+            entry.id_confidence,
         ))
         conn.commit()
         conn.close()
-        print(f"[Registry] 注册 {entity_id} | shot={entry.shot_id} | score={entry.quality_score:.3f}")
+        print(f"[Registry] 注册 {entity_id} | shot={entry.shot_id} | score={entry.quality_score:.3f} | id_conf={entry.id_confidence:.2f}")
 
     def register_batch(self, entity_id: str, entries: List[ReferenceEntry]):
         for e in entries:
@@ -119,7 +127,7 @@ class EntityRegistry:
             order = "shot_id DESC, quality_score DESC"
 
         rows = conn.execute(f"""
-            SELECT entity_id, shot_id, frame_path, crop_path, quality_score, source, created_at
+            SELECT entity_id, shot_id, frame_path, crop_path, quality_score, source, created_at, id_confidence
             FROM ref_entries
             WHERE entity_id = ? AND quality_score >= ?
             ORDER BY {order}
@@ -127,7 +135,14 @@ class EntityRegistry:
         """, (entity_id, min_quality, top_k)).fetchall()
         conn.close()
 
-        return [ReferenceEntry(*row) for row in rows]
+        # 兼容旧数据：如果只有 7 列，补上默认的 id_confidence=1.0
+        results = []
+        for row in rows:
+            if len(row) == 7:
+                results.append(ReferenceEntry(*row, id_confidence=1.0))
+            else:
+                results.append(ReferenceEntry(*row))
+        return results
 
     def query_anchor(
         self,
@@ -162,7 +177,7 @@ class EntityRegistry:
 
         # Step 1: 找最早 shot 中质量最高的参考图
         earliest_best = conn.execute("""
-            SELECT entity_id, shot_id, frame_path, crop_path, quality_score, source, created_at
+            SELECT entity_id, shot_id, frame_path, crop_path, quality_score, source, created_at, id_confidence
             FROM ref_entries
             WHERE entity_id = ? AND quality_score >= ?
             ORDER BY shot_id ASC, quality_score DESC
@@ -175,18 +190,21 @@ class EntityRegistry:
 
         earliest_score = earliest_best[4]  # quality_score
         earliest_shot = earliest_best[1]   # shot_id
+        earliest_id_conf = earliest_best[7] if len(earliest_best) > 7 else 1.0  # id_confidence
 
         # Step 2: 如果最早 shot 已经是高质量，直接返回
         if earliest_score >= high_quality_threshold:
             conn.close()
             print(f"[Registry] 锚点选择: {entity_id} | 最早shot已高质量 "
-                  f"(shot={earliest_shot}, score={earliest_score:.2f})")
+                  f"(shot={earliest_shot}, score={earliest_score:.2f}, id_conf={earliest_id_conf:.2f})")
+            if len(earliest_best) == 7:
+                return ReferenceEntry(*earliest_best, id_confidence=1.0)
             return ReferenceEntry(*earliest_best)
 
         # Step 3: 最早 shot 质量中等，查找后续 shot 中是否有高质量参考
         # 找所有 shot 中最早的高质量参考图
         high_quality_anchor = conn.execute("""
-            SELECT entity_id, shot_id, frame_path, crop_path, quality_score, source, created_at
+            SELECT entity_id, shot_id, frame_path, crop_path, quality_score, source, created_at, id_confidence
             FROM ref_entries
             WHERE entity_id = ? AND quality_score >= ?
             ORDER BY shot_id ASC, quality_score DESC
@@ -198,14 +216,19 @@ class EntityRegistry:
         if high_quality_anchor is not None:
             hq_shot = high_quality_anchor[1]
             hq_score = high_quality_anchor[4]
+            hq_id_conf = high_quality_anchor[7] if len(high_quality_anchor) > 7 else 1.0
             print(f"[Registry] 锚点选择: {entity_id} | 选择后续高质量正脸 "
-                  f"(shot={hq_shot}, score={hq_score:.2f}) 优于最早shot "
+                  f"(shot={hq_shot}, score={hq_score:.2f}, id_conf={hq_id_conf:.2f}) 优于最早shot "
                   f"(shot={earliest_shot}, score={earliest_score:.2f})")
+            if len(high_quality_anchor) == 7:
+                return ReferenceEntry(*high_quality_anchor, id_confidence=1.0)
             return ReferenceEntry(*high_quality_anchor)
 
         # Step 4: 没有高质量参考，回退选最早 shot（防误差累积）
         print(f"[Registry] 锚点选择: {entity_id} | 无高质量参考，回退选最早shot "
-              f"(shot={earliest_shot}, score={earliest_score:.2f})")
+              f"(shot={earliest_shot}, score={earliest_score:.2f}, id_conf={earliest_id_conf:.2f})")
+        if len(earliest_best) == 7:
+            return ReferenceEntry(*earliest_best, id_confidence=1.0)
         return ReferenceEntry(*earliest_best)
 
     def query_anchor_location(

@@ -134,14 +134,16 @@ where $\mathcal{I}_n$ is the set of reference images retrieved from the registry
 
 \textbf{Subject-Aware Mode Routing.} A critical observation is that S2V mode requires \emph{subject} references (characters or objects) to anchor the visual appearance. If only \emph{location} references are available, the S2V model lacks appearance constraints for foreground entities, often resulting in style drift (e.g., generating animated characters instead of photorealistic ones).
 
-We introduce a \textbf{subject-aware routing} mechanism:
+We introduce a \textbf{subject-aware routing} mechanism that considers only \emph{frontal} character references:
 \begin{equation}
 \text{mode} = \begin{cases}
-\text{S2V} & \text{if } \exists e \in \mathcal{E}_n^{\text{subj}} : \mathcal{R}[e] \neq \emptyset \\
+\text{S2V} & \text{if } \exists e \in \mathcal{E}_n^{\text{subj}} : \mathcal{R}^{\text{frontal}}[e] \neq \emptyset \\
 \text{T2V} & \text{otherwise}
 \end{cases}
 \end{equation}
-where $\mathcal{E}_n^{\text{subj}} = \{e \in \mathcal{E}_n : e.\text{type} \in \{\text{character}, \text{object}\}\}$ are the subject entities.
+where $\mathcal{E}_n^{\text{subj}} = \{e \in \mathcal{E}_n : e.\text{type} \in \{\text{character}, \text{object}\}\}$ are the subject entities, and $\mathcal{R}^{\text{frontal}}[e]$ denotes references with $\text{id\_conf} \geq \tau_{\text{face}}$ for characters.
+
+Critically, characters with only faceless (back-view) references do \emph{not} count as valid subjects for S2V routing. This prevents the S2V model from hallucinating faces based on clothing alone, which typically produces style-inconsistent results.
 
 When falling back to T2V due to missing subject references, we inject an \textbf{Environment Context} layer into the prompt, describing the location's attributes (lighting, atmosphere, setting) to maintain scene consistency through text guidance rather than image conditioning:
 \begin{equation}
@@ -251,6 +253,12 @@ P_{\text{env}} = \bigcup_{e \in \mathcal{E}_n^{\text{loc}}} \text{Format}(\text{
 \end{equation}
 This ensures scene consistency is maintained through text guidance when image conditioning is unavailable.
 
+\textbf{Layer 2.6: Appearance Context (Faceless Characters).} When a character has only faceless references ($\text{id\_conf} < \tau_{\text{face}}$), we inject appearance descriptions to maintain clothing/style consistency:
+\begin{equation}
+P_{\text{appear}} = \bigcup_{e \in \mathcal{E}_n^{\text{faceless}}} \text{Format}(e.\text{type}, e.\text{attr}_{\text{appear}})
+\end{equation}
+where $e.\text{attr}_{\text{appear}}$ includes only appearance-related attributes (hair color, clothing, accessories), excluding attributes that would be meaningless without visual reference (age estimation, facial features).
+
 \textbf{Layer 3: Shot Entity Context.} Detailed descriptions of entities that \emph{actually appear in the current shot}, retrieved from the entity graph:
 \begin{equation}
 P_{\text{entity}} = \bigcup_{e \in \mathcal{E}_n} \text{Format}(e.\text{type}, e.\text{desc}, e.\text{attr})
@@ -260,11 +268,11 @@ P_{\text{entity}} = \bigcup_{e \in \mathcal{E}_n} \text{Format}(e.\text{type}, e
 
 The final prompt is constructed as:
 \begin{equation}
-P_n = P_{\text{global}} \oplus [P_{\text{light}}] \oplus [P_{\text{env}}] \oplus P_{\text{entity}} \oplus s_n
+P_n = P_{\text{global}} \oplus [P_{\text{light}}] \oplus [P_{\text{env}}] \oplus [P_{\text{appear}}] \oplus P_{\text{entity}} \oplus s_n
 \end{equation}
-where $[\cdot]$ denotes conditional inclusion based on the agentic lighting decision (for $P_{\text{light}}$) or T2V fallback mode (for $P_{\text{env}}$).
+where $[\cdot]$ denotes conditional inclusion based on the agentic lighting decision (for $P_{\text{light}}$), T2V fallback mode (for $P_{\text{env}}$), or faceless character presence (for $P_{\text{appear}}$).
 
-This four-layer design ensures that: (1)~stylistic coherence is maintained across shots via the global context, (2)~lighting consistency is preserved even when location references are excluded, (3)~environment consistency is maintained when falling back to T2V, (4)~only relevant entities are described to the generation model, and (5)~the original creative intent of each shot is preserved.
+This four-layer design ensures that: (1)~stylistic coherence is maintained across shots via the global context, (2)~lighting consistency is preserved even when location references are excluded, (3)~environment consistency is maintained when falling back to T2V, (4)~appearance consistency is maintained for faceless characters via text, (5)~only relevant entities are described to the generation model, and (6)~the original creative intent of each shot is preserved.
 
 % ----------------------------------------------------------------------------
 \subsection{Post-Generation Visual Grounding}
@@ -324,11 +332,32 @@ with $\alpha_1 = 0.4$, $\alpha_2 = 0.4$, $\alpha_3 = 0.2$.
 
 \begin{itemize}
     \item $q_{\text{sharp}}$: Laplacian variance normalized to [0,1], measuring image sharpness.
-    \item $q_{\text{id}}$: For \texttt{character}-type entities, the face detection confidence from InsightFace~\cite{insightface}; for other entity types, the CLIP cosine similarity.
+    \item $q_{\text{id}}$: For \texttt{character}-type entities, the face detection confidence from InsightFace~\cite{insightface}; for other entity types, the CLIP cosine similarity. This score is also stored as \texttt{id\_confidence} in the registry for downstream frontal-aware filtering.
     \item $q_{\text{pose}}$: For characters, a heuristic frontal score based on face landmark yaw/pitch angles; for objects/locations, this term is set to~1.
 \end{itemize}
 
 We discard crops with $q(c) < \tau_q = 0.4$ and keep at most $K_{\max} = 3$ best crops per entity per shot.
+
+\textbf{Frontal-Aware Character Reference Selection.} A critical observation is that S2V models like Phantom can generate semantically plausible faces from back-view or faceless character references, but these ``hallucinated'' faces often drift into unintended styles (e.g., animated or cartoon-like) because no facial identity constraint is provided.
+
+To address this, we store the face detection confidence $q_{\text{id}}$ (from InsightFace) as \texttt{id\_confidence} for each character crop. At reference selection time, we filter character anchors:
+\begin{equation}
+\mathcal{I}_{\text{ch}}^{\text{valid}} = \{c \in \mathcal{I}_{\text{ch}} : c.\text{id\_conf} \geq \tau_{\text{face}}\}
+\end{equation}
+where $\tau_{\text{face}} = 0.3$ by default. Characters with $\text{id\_conf} < \tau_{\text{face}}$ are considered ``faceless'' (back views, heavily occluded, or profile shots without detectable face).
+
+For faceless characters, we inject an \textbf{Appearance Context} layer into the prompt instead of using the visual reference:
+\begin{equation}
+P_{\text{appear}} = \text{``[Appearance Context - No Frontal Reference]''} \oplus \bigcup_{e \in \mathcal{E}^{\text{faceless}}} \text{Format}(e.\text{attr})
+\end{equation}
+where $e.\text{attr}$ includes appearance-related attributes (hair color, clothing, accessories) extracted during entity parsing.
+
+This \textbf{frontal-aware} strategy ensures:
+\begin{enumerate}
+    \item S2V mode only receives character references with visible faces, preventing face hallucination.
+    \item Faceless characters maintain appearance consistency through detailed text descriptions.
+    \item Location references remain usable (no full fallback to T2V), preserving scene consistency.
+\end{enumerate}
 
 % ----------------------------------------------------------------------------
 \subsection{Entity Registry}
