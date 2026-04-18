@@ -283,43 +283,40 @@ After generating video $v_n$, we perform visual grounding to extract entity crop
 
 \textbf{Frame Extraction.} We uniformly sample frames from $v_n$ at 1~FPS, yielding a set of frames $\mathcal{F}_n = \{f_1, f_2, \ldots, f_K\}$.
 
-\textbf{Open-Vocabulary Detection.} For each entity $e \in \mathcal{E}_n$ with priority $\neq \text{low}$, we run Grounding DINO~\cite{liu2023grounding} on each frame:
+\textbf{End-to-End Referring Video Object Segmentation with ReferDINO.} Rather than a two-stage detection-then-segmentation pipeline (e.g., Grounding DINO + SAM), we adopt ReferDINO~\cite{liang2025referdino}, an end-to-end referring video object segmentation model. ReferDINO offers several advantages:
+
+\begin{itemize}
+    \item \textbf{Unified detection and segmentation}: Directly outputs pixel-level masks without requiring a separate segmentation stage, simplifying the pipeline and reducing latency.
+    \item \textbf{Temporal consistency}: The object-consistent temporal enhancer maintains stable object identity across frames, reducing flickering and identity switches in extracted crops.
+    \item \textbf{Real-time inference}: Achieves 51~FPS, significantly faster than sequential DINO+SAM pipelines.
+\end{itemize}
+
+\textbf{Multi-Entity Joint Detection.} A key empirical observation is that detecting multiple entities \emph{jointly} yields better disambiguation than detecting each entity independently. When entities share similar visual characteristics (e.g., ``woman in white bee suit'' and ``boy in white bee suit''), independent detection may confuse them. Joint detection allows the model to leverage \emph{contrastive} relationships between entity descriptions.
+
+We construct a joint caption by concatenating all entity descriptions:
 \begin{equation}
-\mathcal{B}_{e,k} = \text{GDINO}(f_k,\ e.\text{desc},\ \tau_{\text{box}})
+\mathcal{P}_{\text{joint}} = e_1.\text{desc} \oplus \text{`` . ''} \oplus e_2.\text{desc} \oplus \cdots
 \end{equation}
-For each detected box, we run SAM2~\cite{ravi2024sam2} to obtain a refined segmentation mask $m_{e,k}$, and extract the masked crop with white background:
+and run ReferDINO inference once per frame set:
+\begin{equation}
+\{(m_e, b_e, s_e)\}_{e \in \mathcal{E}_n} = \text{ReferDINO}(\mathcal{F}_n, \mathcal{P}_{\text{joint}})
+\end{equation}
+where $m_e$ is the pixel-level mask, $b_e$ is the bounding box, and $s_e$ is the confidence score for each entity.
+
+For each detected entity, we extract the masked crop with white background:
 \begin{equation}
 c_{e,k} = \text{MaskedCrop}(f_k,\ m_{e,k})
 \end{equation}
 
-\textbf{Cross-Entity IoU Deduplication.} In multi-person scenes, open-vocabulary detection may incorrectly localize entity~$A$'s bounding box onto entity~$B$ (e.g., detecting ``young boy'' on an ``elderly man'' since both are persons). To address this, we perform cross-entity IoU deduplication within each frame:
-
-\begin{enumerate}
-    \item Collect all detection results across all entities for each frame.
-    \item Sort detections by confidence score (descending).
-    \item For each detection, suppress any lower-confidence detection from a \emph{different} entity with IoU $> \tau_{\text{IoU}}$ (default 0.5).
-\end{enumerate}
-
-This ensures that each detected region is assigned to at most one entity---the one with highest detection confidence.
+\textbf{Cross-Entity IoU Deduplication.} Despite joint detection's improved disambiguation, we retain a post-processing IoU deduplication step for robustness. In multi-person scenes, if two entities' masks overlap significantly (IoU $> \tau_{\text{IoU}}$, default 0.5), we keep only the higher-confidence detection and suppress the other.
 
 \textbf{Location Entity Extraction via Background Inpainting.} For \texttt{location}-type entities (e.g., ``sandy desert'', ``rainy alley''), we need a clean background reference without foreground characters. We achieve this through a foreground removal pipeline:
 \begin{enumerate}
-    \item Detect all foreground elements using a broad query with Grounding DINO.
-    \item For each detected box, obtain a precise segmentation mask via SAM2.
+    \item Use ReferDINO to segment all foreground entities (characters, objects) with a joint caption.
     \item Compute the union of all foreground masks and apply morphological dilation.
     \item Use \texttt{cv2.inpaint} to fill masked regions, yielding a clean background frame.
 \end{enumerate}
 This inpainted background serves as the location reference for subsequent shots, ensuring scene consistency without character contamination.
-
-\textbf{Registry-Aware Foreground Removal.} A limitation of naive background extraction is that it relies on generic detection prompts (``person'', ``object''), which may fail to detect specific foreground entities that have been registered in earlier shots. For example, a ``white woven bassinet'' registered in Shot~2 may not be detected by generic prompts when extracting the background for Shot~3, leaving visual artifacts in the location reference.
-
-To address this, we introduce \textbf{registry-aware foreground removal}: before extracting a location background, we query the Entity Registry for all registered non-location entities and augment the detection prompt with their text descriptions:
-\begin{equation}
-\mathcal{P}_{\text{fg}} = \mathcal{P}_{\text{base}} \cup \{e.\text{desc} : e \in \mathcal{R}, e.\text{type} \neq \text{location}\}
-\end{equation}
-where $\mathcal{P}_{\text{base}} = \{\text{``person'', ``people'', ``man'', ``woman'', ``baby'', ``child'', ``object''}\}$ are generic foreground terms.
-
-This ensures that \emph{all previously registered entities}---including specific objects like bassinets, weapons, or vehicles---are detected and removed from the background, producing cleaner location references that do not contaminate subsequent shots with residual foreground elements.
 
 % ----------------------------------------------------------------------------
 \subsection{Reference Quality Scoring}
@@ -458,14 +455,11 @@ Algorithm~\ref{alg:pipeline} presents the full agentic pipeline. The loop proces
         \STATE $v_n \leftarrow \mathcal{G}_{\text{T2V}}(P_n, \text{seed}_n)$
     \ENDIF
     \STATE $\mathcal{F}_n \leftarrow \text{ExtractFrames}(v_n, \text{fps}=1)$
-    \STATE \COMMENT{Ground all entities, then IoU dedup}
-    \STATE $\mathcal{D} \leftarrow \emptyset$
-    \FOR{each $e \in \mathcal{E}_n$ with priority $\neq$ low}
-        \IF{$e.\text{type} = \text{location}$}
-            \STATE $\mathcal{D}[e] \leftarrow$ Inpaint$(\mathcal{F}_n)$
-        \ELSE
-            \STATE $\mathcal{D}[e] \leftarrow$ GDINO+SAM2$(\mathcal{F}_n, e.\text{desc})$
-        \ENDIF
+    \STATE \COMMENT{Joint multi-entity grounding with ReferDINO}
+    \STATE $\mathcal{P}_{\text{joint}} \leftarrow \text{JoinDescriptions}(\mathcal{E}_n)$
+    \STATE $\mathcal{D} \leftarrow \text{ReferDINO}(\mathcal{F}_n, \mathcal{P}_{\text{joint}})$
+    \FOR{each $e \in \mathcal{E}_n^{\text{loc}}$}
+        \STATE $\mathcal{D}[e] \leftarrow$ Inpaint$(\mathcal{F}_n, \mathcal{D})$ \COMMENT{Remove fg, keep bg}
     \ENDFOR
     \STATE $\mathcal{D} \leftarrow \text{IoUDedup}(\mathcal{D}, \tau_{\text{IoU}})$
     \FOR{each $e \in \mathcal{E}_n$ with priority $\neq$ low}

@@ -10,7 +10,7 @@
 
 ---
 
-## 核心流程详解
+## 核心流程详解 ·
 
 整个 Pipeline 按镜头顺序执行，每个镜头经历 **解析 → 路由 → 生成 → Grounding → 入库** 五个阶段。
 
@@ -20,14 +20,14 @@
 
 用 LLM（Claude）读取当前镜头的文字描述，从中识别出所有需要跨镜头保持一致的"实体"：
 
-| 实体类型 | 示例 | Grounding 优先级 |
-|---------|------|-----------------|
-| `character` | "留胡子的男人"、"戴白色面具的人" | high |
-| `object` | "狙击步枪"、"皮质日记本" | medium |
-| `location` | "沙漠废墟"、"私人书房" | medium |
-| `style` | "赛博朋克风格" | low |
+| 实体类型　　| 示例　　　　　　　　　　　　　　 | Grounding 优先级 |
+| -------------| ----------------------------------| ------------------|
+| `character` | "留胡子的男人"、"戴白色面具的人" | high　　　　　　 |
+| `object`　　| "狙击步枪"、"皮质日记本"　　　　 | medium　　　　　 |
+| `location`　| "沙漠废墟"、"私人书房"　　　　　 | medium　　　　　 |
+| `style`　　 | "赛博朋克风格"　　　　　　　　　 | low　　　　　　　|
 
-**每个实体的数据结构**：
+**每个实体的数据结构**：（memory）
 ```python
 @dataclass
 class Entity:
@@ -172,7 +172,7 @@ Pipeline 在正式处理镜头前，会：
 
 **Subject-Aware 路由（防止风格漂移）**：
 
-这是 v2.0 新增的关键设计。观察发现：当只有 location 参考图而没有 subject（character/object）参考图时，S2V 模型缺少人物外观锚定，会导致生成的人物风格漂移（例如真人变成动画风格）。
+观察发现：当只有 location 参考图而没有 subject（character/object）参考图时，S2V 模型缺少人物外观锚定，会导致生成的人物风格漂移（例如真人变成动画风格）。
 
 **解决方案**：基于是否有 subject 参考图来决定生成模式：
 - 有 character/object ref → S2V，外观有锚定
@@ -606,9 +606,35 @@ def _phantom_s2v_generate(self, prompt, references, output_path):
 
 ### 阶段五：Visual Grounding（生成后执行）
 
-**文件**：`visual_grounding/grounder.py`
+**文件**：`visual_grounding/referdino_grounder.py`
 
 生成完视频后，对视频做"角色定位"，把高质量截图存入 Registry 供下一个镜头使用。
+
+**v3.0 重大更新**：使用 **ReferDINO** 替代原有的 Grounding DINO + SAM 两步流程。
+
+#### ReferDINO 优势
+
+| 维度 | 原方案 (DINO + SAM) | ReferDINO |
+|------|---------------------|-----------|
+| **步骤** | 两步：检测 → 分割 | 一步：端到端分割 |
+| **速度** | 较慢（两模型串行） | **51 FPS**（快 5-10x）|
+| **时序一致性** | 无（逐帧独立） | **有**（temporal enhancer）|
+| **多实体消歧** | 需手动拼 caption | **原生支持**联合检测 |
+
+#### 多实体联合检测（核心特性）
+
+ReferDINO 支持同时输入多个实体描述，利用对比关系消歧。例如：
+
+```python
+entities = [
+    {"entity_id": "woman", "text": "woman in white bee suit"},
+    {"entity_id": "boy", "text": "boy in white bee suit"},
+]
+# → joint_caption = "woman in white bee suit . boy in white bee suit"
+# → 模型同时看到两个描述，能更准确地区分两者
+```
+
+**经验发现**：多实体同时输入比逐个检测效果更好（用户实测）。
 
 #### Step 1：抽帧
 
@@ -619,82 +645,34 @@ def extract_frames(video_path, output_dir, fps=1.0):
     # fps=1.0 → 提取约 3-4 帧
 ```
 
-#### Step 2：Grounding DINO 检测
-
-开放词汇目标检测，根据实体的 `text_description` 定位边界框：
+#### Step 2：ReferDINO 多实体联合检测 + 分割
 
 ```python
-boxes, logits, phrases = predict(
-    model=self._gdino_model,
-    image=image_tensor,
-    caption="bearded man with sniper rifle",  # entity.text_description
-    box_threshold=0.35,
-    text_threshold=0.25,
+# 多实体联合检测（利用对比消歧）
+multi_result = grounder.ground_with_joint_caption(
+    frame_paths=frames,
+    entities=[
+        {"entity_id": "char_woman", "text": "woman in white bee suit", "type": "character"},
+        {"entity_id": "char_boy", "text": "boy in white bee suit", "type": "character"},
+    ],
+    output_dir=crops_dir,
 )
-# 返回：边界框坐标 + 置信度分数
+
+# 输出：每个实体的 pixel-level mask + 白底前景裁切图
+for entity_id, results in multi_result.results_by_entity.items():
+    print(f"{entity_id}: {len(results)} crops")
 ```
 
-#### Step 3：SAM2 精细分割
+#### Location 类型特殊处理
 
-对检测到的边界框做像素级分割，提取干净的前景：
-
-```python
-def _extract_with_sam2(self, image_rgb, bbox):
-    self._sam2_predictor.set_image(image_rgb)
-    masks, scores, _ = self._sam2_predictor.predict(
-        box=np.array([[x1, y1, x2, y2]]),
-        multimask_output=False,
-    )
-    # 前景保留，背景填白
-    result = image_rgb.copy()
-    result[mask == 0] = 255
-    return result[y1:y2, x1:x2]
-```
-
-**Location 类型特殊处理**：
 ```python
 if entity_type == "location":
-    # 检测所有前景 → SAM2 得到 union mask → cv2.inpaint 填充
+    # ReferDINO 检测前景 → 得到 mask → cv2.inpaint 填充
     # 返回干净的背景帧作为场景参考
-    bg_img = self._extract_background(image_source, image_tensor)
+    bg_img = self._extract_background(image_rgb, foreground_mask)
 ```
 
-**Registry-Aware 前景移除（v2.2 新增）**：
-
-传统的背景提取只使用通用词（person, people, object）来检测前景。但当场景中存在特定物体（如 bassinet 婴儿篮）时，这些通用词可能无法覆盖，导致 location crop 中残留前景物体。
-
-**问题示例**：
-```
-Shot 2: 婴儿篮 (obj_bassinet) 被注册到 Registry
-Shot 3: 提取 loc_pine_forest 背景时，bassinet 没有被移除
-       → location crop 中包含了 bassinet 的残影
-```
-
-**解决方案**：在提取 location 背景时，动态查询 Registry 中已注册的所有非 location 实体，将它们的 text_description 添加到前景检测 prompt 中：
-
-```python
-# 获取已注册的前景实体描述
-registered_fg_ids = registry.get_registered_foreground_entities()  # 排除 loc_ 前缀
-fg_descriptions = [parser.get_entity(eid).text_description for eid in registered_fg_ids]
-
-# 构建增强的前景检测 prompt
-base_prompts = ["person", "people", "man", "woman", "baby", "child", "object"]
-base_prompts.extend(fg_descriptions)  # 添加 "white woven bassinet", "newborn baby" 等
-caption = " . ".join(base_prompts)
-
-# Grounding DINO 现在能检测到 bassinet 并将其移除
-boxes, logits, _ = predict(model, image, caption=caption, ...)
-```
-
-**效果**：
-```
-[Pipeline] Location grounding 将移除 3 个已注册前景实体: ['char_man', 'char_newborn_baby', 'obj_bassinet']
-[Grounder] Location background extraction: removing 3 registered foreground entities
-```
-
-这确保了 location crop 是真正干净的背景，不包含任何已知的前景实体。
-
-#### Step 4：Re-ID 质量评分
+#### Step 3：Re-ID 质量评分
 
 **文件**：`visual_grounding/reid.py`
 
@@ -912,26 +890,29 @@ T2V_Grounding/
 │   └── test_scene_consistency.yaml  # 测试脚本05：场景一致性
 ├── phase1_poc/
 │   ├── run_demo.py                  # 主入口（单卡/多卡通用）
+│   ├── scripts/
+│   │   └── setup_referdino.sh       # 【v3.0】ReferDINO 一键安装脚本
 │   ├── entity_parser/
 │   │   └── parser.py                # LLM 实体提取 + 共指消解 + 全局语义提取 + 实体数量提取 + 光线分析
 │   ├── visual_grounding/
-│   │   ├── grounder.py              # Grounding DINO + SAM2
+│   │   ├── referdino_grounder.py    # 【v3.0】ReferDINO 端到端分割（替代 DINO+SAM）
+│   │   ├── grounder.py              # [废弃] 原 Grounding DINO + SAM2
 │   │   └── reid.py                  # Re-ID 质量打分
-│   ├── verification/                # 【新增】Shot 1 验证模块
+│   ├── verification/
 │   │   └── entity_count_verifier.py # 实体数量验证 + 重试逻辑
 │   ├── reference_manager/
 │   │   └── registry.py              # Entity Registry（SQLite）
 │   ├── generator/
 │   │   └── ref2video.py             # WanT2V / Phantom S2V 封装
 │   ├── orchestrator/
-│   │   └── pipeline.py              # 主 Pipeline + 四层 Prompt 构建 + 验证循环 + Agentic 光线决策
+│   │   └── pipeline.py              # 主 Pipeline + 四层 Prompt 构建 + ReferDINO 多实体联合检测
 │   ├── utils/
 │   │   └── llm_client.py            # LLM API 封装
-│   └── weights/                     # 模型权重
-│       ├── groundingdino_swinb_cogcoor.pth
-│       ├── GroundingDINO_SwinB_cfg.py
-│       ├── bert-based-uncased/
-│       └── sam2_hiera_large.pt
+│   └── weights/
+│       └── referdino/               # 【v3.0】ReferDINO 模型（由 setup_referdino.sh 安装）
+│           ├── configs/
+│           ├── ckpt/ryt_mevis_swinb.pth
+│           └── pretrained/groundingdino_swinb_cogcoor.pth
 ├── phase2_system/
 │   └── agent_orchestrator.py        # Agentic Loop（Phase 2，开发中）
 └── evaluation/
@@ -947,15 +928,21 @@ T2V_Grounding/
 
 ```bash
 # 基础依赖
-pip install openai pyyaml opencv-python pillow easydict ftfy imageio imageio-ffmpeg
+pip install openai pyyaml opencv-python pillow easydict ftfy imageio imageio-ffmpeg ruamel.yaml rich
 
-# 视觉模型
-pip install groundingdino-py
-pip install git+https://github.com/facebookresearch/sam2.git
+# ReferDINO 安装（推荐：一键脚本）
+bash phase1_poc/scripts/setup_referdino.sh
+
+# 或者手动安装：
+# git clone https://github.com/iSEE-Laboratory/ReferDINO.git phase1_poc/weights/referdino
+# cd phase1_poc/weights/referdino && pip install -r requirements.txt
+# cd models/GroundingDINO/ops && python setup.py build install
+# wget -P ckpt https://huggingface.co/liangtm/referdino/resolve/main/ryt_mevis_swinb.pth
+
+# Re-ID 质量评分（人脸检测）
 pip install insightface onnxruntime-gpu
 
 # FlashAttention（USP 序列并行需要）
-# Ubuntu 18.04 需要用预编译 wheel：
 pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.0.post2/flash_attn-2.7.0.post2+cu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
 ```
 

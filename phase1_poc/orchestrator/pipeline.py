@@ -37,7 +37,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from entity_parser.parser import EntityParser, ParseResult, Entity, EntityCountInfo, CloseupLightingAnalysis
-from visual_grounding.grounder import VideoGrounder, extract_frames
+from visual_grounding.referdino_grounder import ReferDINOGrounder, extract_frames, MultiEntityGroundingResult
 from visual_grounding.reid import ReferenceQualityScorer
 from reference_manager.registry import EntityRegistry, ReferenceEntry
 from generator.ref2video import Reference2VideoGenerator, GenerationConfig
@@ -143,11 +143,9 @@ class T2VGroundingPipeline:
                 os.path.join(output_dir, "registry", "entities.db")
             )
             if not self.mock_mode:
-                self.grounder = VideoGrounder(
-                    device=device, box_threshold=grounding_threshold
-                )
+                self.grounder = ReferDINOGrounder(device=device)
                 self.scorer = ReferenceQualityScorer(device=device)
-                # 初始化验证器
+                # 初始化验证器（仍使用 ReferDINO）
                 self.verifier = EntityCountVerifier(
                     grounder=self.grounder,
                     detection_threshold=grounding_threshold,
@@ -832,6 +830,8 @@ class T2VGroundingPipeline:
         """
         对已生成的视频做 Grounding，提取每个实体的 crop，
         质量评分后存入 Entity Registry，供后续镜头使用。
+
+        使用 ReferDINO 进行多实体联合检测，利用对比消歧效果更好。
         """
         frames_dir = os.path.join(
             self.output_dir, "frames", f"shot_{shot_id:03d}"
@@ -844,22 +844,8 @@ class T2VGroundingPipeline:
             print(f"[Pipeline] 抽帧失败: {video_path}")
             return {}
 
-        # ── Step 1: 先对所有实体做 grounding ──────────────────────────────────
-        all_ground_results = {}  # entity_id -> [GroundingResult, ...]
-
-        # 获取已注册的前景实体描述（用于 location grounding 时排除）
-        # 这样在提取 location 背景时，可以把 bassinet 等已注册物体也移除掉
-        registered_fg_entity_ids = self.registry.get_registered_foreground_entities()
-        registered_fg_descriptions = []
-        for fg_eid in registered_fg_entity_ids:
-            fg_entity = self.parser._get_entity(fg_eid)
-            if fg_entity and fg_entity.text_description:
-                # 使用实体的文本描述作为 grounding prompt
-                registered_fg_descriptions.append(fg_entity.text_description)
-        if registered_fg_descriptions:
-            print(f"[Pipeline] Location grounding 将移除 {len(registered_fg_descriptions)} 个"
-                  f"已注册前景实体: {registered_fg_entity_ids}")
-
+        # ── Step 1: 收集需要 grounding 的实体 ──────────────────────────────────
+        entities_to_ground = []
         for entity in parse_result.entities:
             # 跳过低优先级实体
             if entity.grounding_priority == "low":
@@ -868,26 +854,38 @@ class T2VGroundingPipeline:
             if entity.type == "style":
                 print(f"[Pipeline] 跳过 style 实体 {entity.entity_id}（风格通过 Global Context 处理）")
                 continue
+            entities_to_ground.append({
+                "entity_id": entity.entity_id,
+                "text": entity.text_description,
+                "type": entity.type,
+            })
 
-            # Grounding DINO 定位
-            # 对于 location 类型，传入已注册的前景实体描述，以便提取更干净的背景
-            fg_descs_for_loc = registered_fg_descriptions if entity.type == "location" else None
-            ground_results = self.grounder.ground_in_frames(
-                frame_paths=frames,
-                entity_text=entity.text_description,
-                entity_id=entity.entity_id,
-                output_dir=crops_dir,
-                max_results=5,
-                entity_type=entity.type,
-                registered_fg_descriptions=fg_descs_for_loc,
-            )
-            if ground_results:
-                all_ground_results[entity.entity_id] = ground_results
+        if not entities_to_ground:
+            print(f"[Pipeline] 无需要 grounding 的实体")
+            return {}
+
+        # ── Step 2: 使用 ReferDINO 多实体联合检测 ─────────────────────────────
+        # ReferDINO 的优势：多实体同时输入时，利用对比关系消歧，效果更好
+        # 例如 "woman in white bee suit" 和 "boy in white bee suit" 同时检测
+        print(f"[Pipeline] ReferDINO 多实体联合检测: {[e['entity_id'] for e in entities_to_ground]}")
+
+        multi_result = self.grounder.ground_with_joint_caption(
+            frame_paths=frames,
+            entities=entities_to_ground,
+            output_dir=crops_dir,
+            max_results_per_entity=5,
+        )
+
+        # 转换为原有格式
+        all_ground_results = {}
+        for entity_id, results in multi_result.results_by_entity.items():
+            if results:
+                all_ground_results[entity_id] = results
             else:
-                print(f"[Pipeline] {entity.entity_id}: grounding 未找到")
+                print(f"[Pipeline] {entity_id}: grounding 未找到")
 
-        # ── Step 2: 跨实体 IoU 去重 ───────────────────────────────────────────
-        # 只对 character 类型做去重（location/object 不需要）
+        # ── Step 3: 跨实体 IoU 去重 ───────────────────────────────────────────
+        # ReferDINO 的联合检测已经有较好的区分，但仍做一次去重保险
         character_entities = {
             e.entity_id for e in parse_result.entities if e.type == "character"
         }
@@ -900,7 +898,7 @@ class T2VGroundingPipeline:
             deduped_char = self._cross_entity_dedup(char_results, iou_threshold=0.5)
             all_ground_results.update(deduped_char)
 
-        # ── Step 3: 质量评分 + 入库 ───────────────────────────────────────────
+        # ── Step 4: 质量评分 + 入库 ───────────────────────────────────────────
         grounded: dict = {}
 
         for entity in parse_result.entities:
