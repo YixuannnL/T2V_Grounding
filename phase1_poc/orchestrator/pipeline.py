@@ -234,6 +234,19 @@ class T2VGroundingPipeline:
             is_closeup = any(kw in shot_text_lower for kw in ["close-up", "closeup", "close up", "tight shot", "focuses on"])
             is_wide = any(kw in shot_text_lower for kw in ["wide shot", "wide angle", "establishing shot", "full shot"])
 
+            # ── 检测局部特写（手、脚、物体等）─────────────────────────────────
+            # 对于局部特写，即使 LLM 关联到某个 character，也不应该用人脸参考图
+            # 因为手部特写用人脸参考会导致奇怪的结果
+            body_part_keywords = [
+                "hand", "hands", "finger", "fingers", "palm",
+                "foot", "feet", "leg", "legs",
+                "arm", "arms", "shoulder",
+                "back", "torso",
+            ]
+            is_body_part_closeup = is_closeup and any(kw in shot_text_lower for kw in body_part_keywords)
+            if is_body_part_closeup:
+                print(f"[Pipeline] 检测到局部特写镜头（身体部位），将跳过 character 人脸参考图")
+
             # ── 分离 location 和非 location 实体 ──────────────────────────────
             # 注意：过滤掉 style 类型（风格通过 Global Context 处理，不作为参考图）
             location_entities = [e for e in high_priority if e.type == "location"]
@@ -318,6 +331,15 @@ class T2VGroundingPipeline:
             for entity in sorted_non_loc[:max_non_loc_refs]:
                 # character 使用锚点查询：优先选择高质量正脸
                 if entity.type == "character":
+                    # 【v2.4】Body Part Closeup 检查：
+                    # 如果是身体部位特写（手、脚等），即使 LLM 关联到 character，
+                    # 也不应该传人脸参考图，否则会导致生成结果不合理
+                    if is_body_part_closeup:
+                        faceless_characters.append(entity)
+                        print(f"[Pipeline] {entity.entity_id}: 身体部位特写镜头，"
+                              f"跳过人脸参考图，将使用 Appearance Context 描述")
+                        continue
+
                     anchor = self.registry.query_anchor(
                         entity.entity_id,
                         min_quality=self.min_ref_quality,
