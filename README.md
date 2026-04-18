@@ -230,6 +230,41 @@ Note: Maintain visual consistency with the described appearance.
 2. 衣服、发型等外观信息通过 prompt 传递
 3. 当后续 shot 出现正脸时，才开始使用 S2V
 
+**Body Part Closeup Detection（v2.4 新增）**：
+
+观察发现：当镜头是**身体部位特写**（如手部、脚部、肩膀等），即使 LLM 正确关联到某个 character，也不应该传人脸参考图——因为 Phantom 看到人脸参考图会强行注入人脸特征，导致手部特写出现不合理的结果。
+
+**解决方案**：增加 body part closeup 检测，对此类镜头跳过 character 人脸参考图：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│             Body Part Closeup Detection (v2.4)                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  检测关键词：                                                    │
+│  hand, hands, finger, fingers, palm,                            │
+│  foot, feet, leg, legs, arm, arms, shoulder, back, torso        │
+│                                                                 │
+│  判断条件：                                                      │
+│  is_body_part_closeup = is_closeup AND contains(body_keywords)  │
+│                                                                 │
+│  处理逻辑：                                                      │
+│  is_body_part_closeup = True ──► 跳过所有 character 人脸参考图   │
+│                               │                                  │
+│                               └──► 注入 [Appearance Context]     │
+│                                    描述衣服、肤色等外观特征       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**示例**：
+```
+Shot 3: "A close-up focuses on an aged hand with wrinkled skin..."
+
+旧行为: LLM 关联到 char_elderly_man → 传人脸参考图 → 手部特写出现不合理结果 ❌
+新行为: 检测到 "hand" + "close-up" → 跳过人脸参考图 → 使用 Appearance Context ✅
+```
+
 **策略细节**：
 ```
 ┌─────────────────────────────────────────────────────────────────┐
