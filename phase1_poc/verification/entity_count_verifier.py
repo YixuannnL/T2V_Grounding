@@ -9,20 +9,30 @@ verification/entity_count_verifier.py
 
 解决方案:
   1. LLM 解析 prompt 时，提取每类实体的预期数量
-  2. T2V 生成后，用检测模型统计实际生成的实体数量
+  2. T2V 生成后，用 MLLM 统计实际生成的实体数量（比检测模型更准确）
   3. 如果预期 != 实际，则 retry（换 seed 或增强 prompt）
   4. 最多 retry N 次，超出则警告用户
 
 适用场景:
   - 主要针对 Shot 1（纯 T2V 生成，无 reference 约束）
   - 也可用于后续 shot 中新实体首次出现的情况
+
+v2.0 更新:
+  - 将人数检测从 GroundingDINO 改为 MLLM（支持小目标、遮挡等复杂场景）
+  - 保留 detection-based 方法作为 fallback
 """
 
 import os
 import json
+import base64
+import re
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 from enum import Enum
+
+
+# MLLM 验证模型配置（Haiku 快速便宜，Sonnet 更准确）
+MLLM_VERIFICATION_MODEL = "claude-haiku-4-5"
 
 
 class VerificationStatus(Enum):
@@ -106,6 +116,8 @@ class EntityCountVerifier:
         detection_threshold: float = 0.35,
         iou_dedup_threshold: float = 0.5,
         device: str = "cuda",
+        use_mllm: bool = True,  # 默认使用 MLLM 进行人数检测
+        mllm_model: str = MLLM_VERIFICATION_MODEL,
     ):
         """
         Args:
@@ -113,12 +125,17 @@ class EntityCountVerifier:
             detection_threshold: 检测置信度阈值
             iou_dedup_threshold: 同类检测去重的 IoU 阈值
             device: 设备
+            use_mllm: 是否使用 MLLM 进行人数检测（更准确，推荐开启）
+            mllm_model: MLLM 模型名称，默认 claude-haiku-4-5
         """
         self.grounder = grounder
         self.detection_threshold = detection_threshold
         self.iou_dedup_threshold = iou_dedup_threshold
         self.device = device
+        self.use_mllm = use_mllm
+        self.mllm_model = mllm_model
         self._lazy_grounder = None
+        self._llm_client = None
 
     def _get_grounder(self):
         """懒加载 grounder"""
@@ -131,6 +148,13 @@ class EntityCountVerifier:
                 box_threshold=self.detection_threshold,
             )
         return self._lazy_grounder
+
+    def _get_llm_client(self):
+        """懒加载 LLM 客户端"""
+        if self._llm_client is None:
+            from utils.llm_client import LLMClient
+            self._llm_client = LLMClient(model=self.mllm_model)
+        return self._llm_client
 
     def extract_expectations_from_entities(
         self,
@@ -277,8 +301,8 @@ class EntityCountVerifier:
         在视频帧中检测并统计实体数量
 
         策略:
-          - 采样多帧，每帧独立检测
-          - 对每帧的检测结果做 IoU 去重（同一个人可能被多次检测）
+          - 采样多帧，每帧独立计数
+          - 使用 MLLM（默认）或检测模型进行计数
           - 取各帧检测数量的众数（mode）作为最终结果
         """
         import cv2
@@ -318,16 +342,24 @@ class EntityCountVerifier:
         if not frame_paths:
             raise ValueError("采样帧失败")
 
-        # 每种类型分别检测
+        # 每种类型分别计数
         results_per_type = {etype: [] for etype in entity_types}
-        grounder = self._get_grounder()
 
         for etype in entity_types:
             if etype == "person":
-                # 人物检测：使用通用 query
+                # 人物计数：优先使用 MLLM，失败则回退到检测模型
                 frame_counts = []
                 for fp in frame_paths:
-                    count = self._count_persons_in_frame(grounder, fp)
+                    if self.use_mllm:
+                        try:
+                            count = self._count_persons_with_mllm(fp)
+                        except Exception as e:
+                            print(f"[Verify] MLLM 计数失败，回退到检测模型: {e}")
+                            grounder = self._get_grounder()
+                            count = self._count_persons_in_frame(grounder, fp)
+                    else:
+                        grounder = self._get_grounder()
+                        count = self._count_persons_in_frame(grounder, fp)
                     frame_counts.append(count)
                 results_per_type[etype] = frame_counts
             else:
@@ -345,9 +377,84 @@ class EntityCountVerifier:
 
         return final_counts
 
+    def _count_persons_with_mllm(self, frame_path: str) -> int:
+        """
+        使用 MLLM 统计单帧中的人数
+
+        优势:
+          - 比检测模型更准确，尤其对小目标、遮挡、模糊场景
+          - 能理解语义（区分真人 vs 雕像/画像/倒影）
+        """
+        # 读取图片并转为 base64
+        with open(frame_path, "rb") as f:
+            image_data = base64.b64encode(f.read()).decode("utf-8")
+
+        # 获取图片格式
+        ext = os.path.splitext(frame_path)[1].lower()
+        media_type = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".gif": "image/gif",
+            ".webp": "image/webp",
+        }.get(ext, "image/jpeg")
+
+        # 构建 MLLM 请求
+        llm_client = self._get_llm_client()
+
+        prompt = """请仔细观察这张图片，统计图片中的人数。
+
+要求:
+1. 只统计真实的人（包括只露出部分身体的人）
+2. 不要统计雕像、画像、海报、倒影、影子等非真人
+3. 如果人物较小、模糊或部分遮挡，也要尽量统计
+4. 如果图片中没有人，回答 0
+
+请只回答一个数字，不要任何解释。例如: 3"""
+
+        # 使用 OpenAI 兼容的 vision API 格式
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{media_type};base64,{image_data}"
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt
+                    }
+                ]
+            }
+        ]
+
+        response = llm_client.client.chat.completions.create(
+            model=llm_client.model,
+            messages=messages,
+            max_tokens=16,
+            temperature=0.0,
+        )
+
+        result_text = response.choices[0].message.content.strip()
+
+        # 解析数字
+        match = re.search(r'\d+', result_text)
+        if match:
+            count = int(match.group())
+            print(f"[Verify] MLLM 计数结果: {count} (原始回复: {result_text})")
+            return count
+        else:
+            print(f"[Verify] MLLM 回复无法解析为数字: {result_text}，返回 0")
+            return 0
+
     def _count_persons_in_frame(self, grounder, frame_path: str) -> int:
         """
-        统计单帧中的人数
+        [Fallback] 使用检测模型统计单帧中的人数
+
+        注意: 这是 MLLM 失败时的备用方案。检测模型对小目标、遮挡场景不够准确。
 
         策略:
           - 使用 "person" 作为检测 query

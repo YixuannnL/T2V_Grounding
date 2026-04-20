@@ -106,11 +106,24 @@ To address this, we introduce a \textbf{Generation-Verification Loop} for T2V mo
     N_t^{\text{exp}} = |\{e \in \mathcal{E}_n : e.\text{type} = t\}|
     \end{equation}
 
-    \item \textbf{Post-Generation Verification.} After generating $v_n$, we sample $K$ frames uniformly and run person detection with NMS:
+    \item \textbf{Post-Generation Verification with MLLM.} After generating $v_n$, we sample $K$ frames uniformly and count persons using a multimodal LLM (Claude Haiku 4.5). The MLLM approach offers several advantages over detection-based counting:
+    \begin{itemize}
+        \item \textbf{Semantic understanding}: Can distinguish real people from statues, paintings, reflections, or posters
+        \item \textbf{Robustness to occlusion}: Understands partial visibility and overlapping figures
+        \item \textbf{Small target detection}: More reliable for distant or blurred figures that detection models often miss
+    \end{itemize}
+
+    For each sampled frame $f_k$, we query the MLLM:
     \begin{equation}
-    N_{\text{person}}^{\text{act}} = \text{mode}\bigl(\{\text{count}(\text{Det}(f_k))\}_{f_k \in \mathcal{F}}\bigr)
+    c_k = \mathcal{M}_{\text{MLLM}}(f_k,\ \text{``Count real people in this image''})
     \end{equation}
-    where we take the mode (most frequent count) for robustness.
+
+    The final count uses mode aggregation for robustness:
+    \begin{equation}
+    N_{\text{person}}^{\text{act}} = \text{mode}\bigl(\{c_k\}_{k=1}^K\bigr)
+    \end{equation}
+
+    If MLLM inference fails, we fall back to detection-based counting (Grounding DINO + NMS).
 
     \item \textbf{Verification and Retry.} If $N_{\text{person}}^{\text{act}} \neq N_{\text{person}}^{\text{exp}}$:
     \begin{itemize}
@@ -124,7 +137,7 @@ To address this, we introduce a \textbf{Generation-Verification Loop} for T2V mo
     \item \textbf{Termination.} Accept if counts match, or after $M_{\max}$ retries (default~3), warn and proceed with best available result.
 \end{enumerate}
 
-This verification loop ensures that the ``anchor'' references established in Shot~1 are semantically correct, preventing error accumulation.
+This verification loop ensures that the ``anchor'' references established in Shot~1 are semantically correct, preventing error accumulation. The MLLM-based counting is particularly effective for complex scenes with partial occlusion, small figures, or non-human entities that might confuse detection models.
 
 \textbf{S2V Mode (subsequent shots with references).} When the registry contains reference crops for at least one high-priority \textbf{subject} entity (character or object) in shot $n$, we switch to a subject-to-video model $\mathcal{G}_{\text{S2V}}$:
 \begin{equation}

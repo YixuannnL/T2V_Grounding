@@ -1,0 +1,63 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# test_night_rider: 单角色 · 5镜头 · 夜间骑马穿越山区场景
+# 测试目标:
+#   Shot 1 → T2V (wide)，建立人+马在山区夜景中的全貌
+#   Shot 2 → T2V (wide cinematic)，大远景展示山谷环境
+#   Shot 3 → Phantom (close-up)，面部特写，测试从远景提取的 character 参考
+#   Shot 4 → Phantom (wide)，不同角度的远景，测试角色+马匹一致性
+#   Shot 5 → Phantom (close-up)，侧面特写，测试跨镜头面部一致性
+# 难点:
+#   - 单角色多镜头，需保持人物面部和服装一致性
+#   - 马匹作为 object 需跨镜头保持一致
+#   - 夜景光照复杂，测试 Agentic 光线分析
+#   - 远景→特写的跨尺度 grounding
+#   - 中国古代服饰细节（长发、皮毛领）需准确传递
+# ──────────────────────────────────────────────────────────────────────────────
+
+global_caption: >
+  A man in traditional Chinese attire is seen riding a horse through a rocky,
+  mountainous landscape at night, interspersed with close-up shots highlighting
+  his serious and contemplative facial expressions. The overall mood is mysterious
+  and dramatic, with the dark night sky and rugged terrain creating a sense of
+  solitary journey.
+
+shots:
+  - shot_id: 1
+    text: >
+      A man in dark clothing rides a brown horse up a grassy, rocky hillside
+      under a dark night sky. The terrain is rugged with scattered rocks and
+      sparse vegetation. The rider sits upright, guiding the horse steadily
+      through the challenging landscape.
+    duration_seconds: 5.0
+
+  - shot_id: 2
+    text: >
+      A wide cinematic shot shows the man and horse standing still in a vast,
+      dark valley surrounded by forested mountains. The scale of the landscape
+      dwarfs the solitary figure, emphasizing the isolation of his journey.
+      Faint moonlight illuminates the scene.
+    duration_seconds: 5.0
+
+  - shot_id: 3
+    text: >
+      A close-up focuses on the young man's face. He has long black hair and
+      is wearing a dark robe with a brown fur-trimmed vest. He looks directly
+      at the camera with a serious expression. His features are sharp, and his
+      eyes convey determination and resolve.
+    duration_seconds: 5.0
+
+  - shot_id: 4
+    text: >
+      Another wide shot from a different angle shows the man on his horse,
+      stationary in the dark, hilly terrain. The horse's brown coat is visible
+      against the shadowy backdrop. The rider appears alert, surveying the
+      surrounding mountains.
+    duration_seconds: 5.0
+
+  - shot_id: 5
+    text: >
+      A final close-up of the man shows him looking off to the side. His
+      expression remains pensive and serious against the dark background.
+      The fur trim of his vest is visible, and wisps of his long black hair
+      frame his face. He seems deep in thought about the journey ahead.
+    duration_seconds: 5.0
