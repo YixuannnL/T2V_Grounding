@@ -37,8 +37,13 @@ Weight/
 models/
 outputs/
 output/
+output_demo/
 runs/
 
 # Optional: ignore datasets
 data/
 datasets/
+
+# process file
+*.mp4
+*.txt

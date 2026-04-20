@@ -9,7 +9,7 @@ set -e
 
 RUNS=${1:-3}
 BASE_OUTPUT=${2:-"/root/paddlejob/workspace/env_run/output/lyx/T2V_Grounding/phase1_poc/output_multi_seed"}
-SCRIPT_NAME=${3:-"test_office_conversation.yaml"}
+SCRIPT_NAME=${3:-"test_night_rider.yaml"}
 
 SCRIPT="/root/paddlejob/workspace/env_run/output/lyx/T2V_Grounding/configs/${SCRIPT_NAME}"
 CONFIG="/root/paddlejob/workspace/env_run/output/lyx/T2V_Grounding/configs/config.yaml"
@@ -26,7 +26,7 @@ echo "  nproc_per_node: $NGPU"
 echo "=========================================="
 
 # 预定义 seed 列表（可重复使用、结果可复现）
-SEEDS=(42 1337 2025 314159 777 99999 12345 54321 66666 11111)
+SEEDS=(1337 2025 314159 777 99999 12345 54321 66666 11111 42)
 
 for i in $(seq 1 "$RUNS"); do
     # 优先使用预定义 seed，超出列表范围则随机生成

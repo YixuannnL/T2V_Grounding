@@ -1,0 +1,64 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# test_council_meeting: 多角色 · 6镜头 · 古代议会/朝堂对话场景
+# 测试目标:
+#   Shot 1 → T2V (close-up)，建立 GreyBeard 外观（银色头饰老者）
+#   Shot 2 → T2V (profile close-up)，建立 Armored 外观（盔甲武士）
+#          ⚠️ profile 侧面可能 id_confidence 低，测试 Frontal-Aware 策略
+#   Shot 3 → T2V (close-up)，手部特写，测试 object grounding
+#   Shot 4 → T2V (close-up)，建立 WhiteBeard 外观（白发老者）
+#   Shot 5 → Phantom (close-up)，Armored 说话，测试 profile 参考
+#   Shot 6 → Phantom (close-up)，GreyBeard 复现，测试跨镜头一致性
+# 难点:
+#   - 多角色（3个人物），需精准匹配各自参考图
+#   - Shot 2/5 为 profile 侧面，测试 id_confidence < 0.3 时的 Appearance Context 回退
+#   - Shot 3 为手部特写，测试非人物实体的 grounding
+#   - 传统/历史服饰细节较多，测试外观描述的传递
+# ──────────────────────────────────────────────────────────────────────────────
+
+global_caption: >
+  The video features a series of close-up shots of different men in traditional
+  or historical attire, suggesting a serious conversation or meeting in a royal
+  court or ancient council chamber. The atmosphere is tense and contemplative.
+
+shots:
+  - shot_id: 1
+    text: >
+      A close-up of a man with a grey beard and a decorative silver headpiece,
+      speaking with authority. He wears ornate traditional robes with intricate
+      gold embroidery. His expression is stern and commanding.
+    duration_seconds: 5.0
+
+  - shot_id: 2
+    text: >
+      A close-up in profile of a man wearing a dark helmet and armor, listening
+      attentively. The helmet has a distinctive angular design. He remains still,
+      his gaze fixed ahead as if absorbing important information.
+    duration_seconds: 5.0
+
+  - shot_id: 3
+    text: >
+      A close-up focuses on an aged hand resting on a patterned surface,
+      possibly a carved wooden armrest or ornate table. The fingers are adorned
+      with rings bearing ancient symbols.
+    duration_seconds: 3.0
+
+  - shot_id: 4
+    text: >
+      A close-up of an elderly man with long white hair and a flowing white beard,
+      looking downwards in deep contemplation. His face shows wisdom and concern,
+      with wrinkles etched by years of experience.
+    duration_seconds: 5.0
+
+  - shot_id: 5
+    text: >
+      The man in the dark helmet and armor is now seen speaking, looking slightly
+      off-camera. His jaw is set with determination as he delivers his words.
+      The armor gleams faintly in the ambient light.
+    duration_seconds: 5.0
+
+  - shot_id: 6
+    text: >
+      The first man with the grey beard and silver headpiece looks downwards,
+      appearing serious and thoughtful. He seems to be weighing a difficult decision,
+      his earlier authority now tempered with reflection.
+    duration_seconds: 5.0

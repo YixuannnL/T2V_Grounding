@@ -1,0 +1,58 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# test_dog_salad_comedy: global_caption + 6 shots
+# 测试目标:
+#   ① global_caption 预建实体图谱（obj_dog / char_woman_1 / char_woman_2 / loc_dining_room）
+#   ② 动物 object 的跨镜头一致性（小狗多次出现）
+#   ③ 双角色相似外观区分（两位穿粉色礼服的女性）
+#   ④ 频繁镜头切换：狗 ↔ 人物反应镜头交替
+#   ⑤ Subject-Aware 路由：测试 object (dog) 作为主体的 grounding
+# ──────────────────────────────────────────────────────────────────────────────
+
+global_caption: >
+  A comedic scene unfolds in a bizarre dining setting featuring an indoor grass
+  floor. A small black and white dog excitedly runs towards a plate of salad
+  placed on the ground. The video cuts back and forth between the dog investigating
+  its unexpected meal and the shocked, disgusted reactions of two women sitting
+  nearby in formal pink dresses.
+
+shots:
+  - shot_id: 1
+    text: >
+      A small black and white dog runs from left to right across a faux-grass
+      floor towards a plate of salad resting on the ground. Two formal black
+      dining chairs sit empty in the background against dark red curtains and
+      wooden slats.
+    duration_seconds: 3.0
+
+  - shot_id: 2
+    text: >
+      The camera cuts to a close-up of a Black woman with an elegant updo,
+      wearing a pink strapless dress and a silver heart necklace. She looks
+      off-camera with an expression of profound shock and mild disgust.
+    duration_seconds: 3.0
+
+  - shot_id: 3
+    text: >
+      A close-up profile shot shows the dog panting happily, its attention
+      fixed on the plate of food just out of frame to the right.
+    duration_seconds: 3.0
+
+  - shot_id: 4
+    text: >
+      The scene cuts back to the first woman in the pink dress, her face still
+      frozen in a look of disbelief and concern as she continues to watch the
+      situation unfold.
+    duration_seconds: 3.0
+
+  - shot_id: 5
+    text: >
+      Another close-up profile of the dog, now looking down intently, sniffing
+      at the plate of salad that is partially visible at the bottom of the frame.
+    duration_seconds: 3.0
+
+  - shot_id: 6
+    text: >
+      A close-up reveals a second Black woman, also styled in a pink strapless
+      dress and heart necklace. She is looking off-camera, her mouth open in a
+      wide expression of surprised exasperation.
+    duration_seconds: 3.0

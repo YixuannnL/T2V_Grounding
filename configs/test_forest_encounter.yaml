@@ -1,0 +1,58 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# test_forest_encounter: global_caption + 6 shots
+# 测试目标:
+#   ① global_caption 预建实体图谱（char_man / char_blonde_woman / obj_baby / loc_pine_forest）
+#   ② 双角色 + 婴儿物体的跨镜头一致性
+#   ③ close-up / medium / wide 多种镜头类型切换
+#   ④ Subject-Aware 路由：测试无 subject ref 时的 T2V 回退逻辑
+#   ⑤ 金色逆光场景的光线一致性（Agentic Light Analysis）
+# ──────────────────────────────────────────────────────────────────────────────
+
+global_caption: >
+  A dramatic scene unfolds in a sunlit pine forest featuring a tense encounter
+  between a man and a blonde woman, with a crying newborn baby present in a
+  bassinet. The video alternates between emotional close-ups of the characters'
+  faces and wider shots of their standoff amidst the tall, straight trees bathed
+  in golden hour light.
+
+shots:
+  - shot_id: 1
+    text: >
+      A close-up shot focuses on a troubled-looking man with messy dark hair,
+      wearing a dark coat and grey scarf, looking downwards with a somber
+      expression against a brightly lit, blurred forest background.
+    duration_seconds: 3.0
+
+  - shot_id: 2
+    text: >
+      The camera cuts to a close-up of a newborn baby wrapped in a white blanket,
+      crying with its mouth open, resting inside a white woven bassinet in the
+      forest setting.
+    duration_seconds: 3.0
+
+  - shot_id: 3
+    text: >
+      A medium shot reveals the man, seen from behind, standing opposite a blonde
+      woman in a white coat who looks at him with a surprised and concerned
+      expression, set against the dramatic vertical lines of the sunlit pine trees.
+    duration_seconds: 3.0
+
+  - shot_id: 4
+    text: >
+      The camera pulls back for a slightly wider view of the man and woman facing
+      each other in the forest, emphasizing the emotional distance between them
+      in the golden light.
+    duration_seconds: 3.0
+
+  - shot_id: 5
+    text: >
+      A tight close-up on the blonde woman's face captures her worried and fearful
+      expression, her blonde hair strongly backlit by the warm, setting sun.
+    duration_seconds: 3.0
+
+  - shot_id: 6
+    text: >
+      The scene returns to a medium shot of the man and woman facing each other
+      in the woods, maintaining their tense standoff as the golden light continues
+      to stream through the dense trees behind them.
+    duration_seconds: 3.0

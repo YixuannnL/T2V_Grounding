@@ -1,0 +1,54 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# test_document_review: 双角色 + 物体 · 5 镜头
+# 测试目标:
+#   ① global_caption 预建实体图谱（char_man_suit / char_young_woman / obj_folder / obj_seal）
+#   ② 测试物体（folder、seal）的跨镜头一致性
+#   ③ 测试 close-up 镜头对手部/文件的 grounding
+#   ④ Shot 1 T2V 建立男性外观，Shot 3 引入女性，后续 Phantom 保持一致
+# 难点:
+#   - 文件/印章等小物体的检测和一致性
+#   - 手部特写中人物身份的关联
+#   - over-the-shoulder shot 的多角色处理
+# ──────────────────────────────────────────────────────────────────────────────
+
+global_caption: >
+  A middle-aged man in a suit and a young woman in a hoodie review a mysterious
+  document together. The scene features close-ups of the document's unique circular
+  seal and the focused expressions of the two individuals as they exchange the folder,
+  suggesting a serious or investigative context.
+
+shots:
+  - shot_id: 1
+    text: >
+      A medium shot of a middle-aged man in a formal dark suit and striped tie,
+      looking down at an open leather folder with a concentrated expression.
+      The setting appears to be an office or meeting room.
+    duration_seconds: 3.0
+
+  - shot_id: 2
+    text: >
+      A close-up of two pairs of hands holding a leather folder open, revealing
+      a page with a distinct gray circular seal or insignia in the center.
+      The document appears official and important.
+    duration_seconds: 3.0
+
+  - shot_id: 3
+    text: >
+      An over-the-shoulder shot showing a young woman with short dark hair,
+      wearing a gray and blue hoodie, looking intently at the documents being
+      held by the man in the dark suit. Her expression is focused and curious.
+    duration_seconds: 3.0
+
+  - shot_id: 4
+    text: >
+      A medium shot of the man in the dark suit looking up and speaking to
+      the young woman in the hoodie, his expression professional and serious.
+      The leather folder is visible in his hands.
+    duration_seconds: 3.0
+
+  - shot_id: 5
+    text: >
+      A close-up of the young woman with short dark hair as she focuses on
+      the contents of the leather folder, holding it with both hands. Her
+      expression shows concentration and concern.
+    duration_seconds: 3.0
