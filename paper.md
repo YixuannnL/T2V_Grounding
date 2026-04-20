@@ -25,24 +25,47 @@
 
 % ============================================================================
 \begin{abstract}
-Omit for now.
+Multi-shot video generation from text scripts requires maintaining consistent visual identity for characters, objects, and scenes across shots. We argue that this is fundamentally an \textbf{agentic} problem: the system must continuously perceive what has been generated, reason about entity identities and quality, and act adaptively---yet existing approaches treat it as a static pipeline. We introduce an agentic framework built on \textbf{Grounding-in-the-Loop}: rather than relying on external reference images, we extract references from the generated videos themselves via visual grounding, creating a self-bootstrapping perception-action loop. Beyond this core loop, our pipeline incorporates multiple runtime agentic decisions---generation verification with automatic retry, subject-aware mode routing, lighting-adaptive reference selection, and frontal-aware filtering---each following an explicit perceive-reason-act pattern. Without any training or fine-tuning, our approach achieves robust cross-shot consistency while preserving full freedom over camera angles and character poses.
 \end{abstract}
 
 % ============================================================================
 \section{Introduction}
 
-The problem of generating a coherent multi-shot video from a text script is fundamentally different from single-shot video generation. A compelling visual narrative requires that the same character appearing across different shots---in different scenes, lighting conditions, camera angles, and actions---be recognizably the same person. Current state-of-the-art T2V models~\cite{wan2024wan,yang2024cogvideox,gen3} treat each shot as an independent generation task, resulting in significant character appearance drift that renders multi-shot narratives visually incoherent.
+Generating a coherent multi-shot video from a text script is fundamentally harder than single-shot generation. A compelling visual narrative demands that the same character---appearing across different shots with varying camera angles, lighting, and actions---remains recognizably consistent. Yet current T2V models~\cite{wan2024wan,yang2024cogvideox,gen3} treat each shot as an independent generation, causing severe appearance drift that breaks narrative coherence.
 
-Several directions have been proposed to address visual consistency in generative models. Image-to-video (I2V) methods~\cite{wan2024wan} condition generation on a reference first frame, but this locks both the character appearance \emph{and} the composition/pose---unsuitable for shots with different camera angles or actions. Training-based approaches~\cite{dreambooth_video,dreamvideo} require per-character fine-tuning, which is impractical at inference time. Reference-conditioned generation approaches~\cite{ye2023ip,phantom} can condition on appearance without fixing pose, but they assume reference images are available as inputs---raising the question of where these references come from in an automated pipeline.
+What makes multi-shot generation so challenging? We argue that it is inherently an \textbf{agentic} problem: the system must continuously \emph{perceive} what has been generated, \emph{reason} about entity identities and visual quality, and \emph{act} adaptively to maintain consistency---all while handling the uncertainty and errors inevitable in generative models. Yet existing approaches treat it as a static pipeline problem. End-to-end multi-shot models~\cite{shotstream,multishotmaster,echoshot} learn consistency implicitly through training, offering no mechanism to inspect or correct failures at runtime. Reference-based pipelines~\cite{videomemory,storydiffusion} follow fixed ``plan $\to$ generate $\to$ store'' workflows without feedback loops. When generation errors occur---wrong entity count, poor reference quality, style mismatch---these systems have no way to detect or recover from them.
 
-Our key observation is: \textbf{the generated video itself is the best source of reference images for future shots.} Rather than relying on an external character database or manual reference image provision, we propose to extract reference images \emph{from each generated shot} using visual grounding, and use them to condition subsequent shots. This creates a generation-grounding feedback loop that progressively builds a richer visual reference bank as more shots are generated.
+We propose to reframe multi-shot video generation as an \textbf{agentic process} with explicit perception-reasoning-action loops. Our key insight is that maintaining visual consistency requires the system to actively monitor its own outputs and make runtime decisions, rather than blindly executing a predetermined plan.
 
-We make the following contributions:
+This agentic perspective leads to our core design: \textbf{Grounding-in-the-Loop}. Instead of relying on externally-provided or separately-generated reference images, we extract references directly from the generated videos via visual grounding. This is itself an agentic act---the system \emph{perceives} what it has generated, \emph{extracts} entity representations, and \emph{uses} them to condition future generation. The loop is self-bootstrapping: Shot~1 generates content $\to$ grounding extracts entity crops $\to$ crops become references for Shot~2 $\to$ grounding enriches the reference bank further. Crucially, references extracted from generated videos are guaranteed to be stylistically consistent---same model, same rendering pipeline, same visual distribution.
+
+Beyond the grounding loop, our pipeline incorporates multiple \textbf{runtime agentic decisions}:
+
+\begin{itemize}
+    \item \textbf{Generation-Verification Loop:} After generating anchor shots, we \emph{perceive} entity counts using a multimodal LLM, \emph{reason} about correctness, and \emph{act} by retrying with adjusted seeds or enhanced prompts if mismatches occur---preventing errors from propagating.
+
+    \item \textbf{Subject-Aware Mode Routing:} We \emph{perceive} what references are available, \emph{reason} about whether subject (character/object) anchoring exists, and \emph{act} by routing to T2V or S2V accordingly---avoiding style drift from location-only conditioning.
+
+    \item \textbf{Agentic Lighting Analysis:} For close-up shots, an LLM \emph{perceives} the scene's lighting complexity, \emph{reasons} about whether visual reference or textual description better preserves consistency, and \emph{acts} by including or excluding location references.
+
+    \item \textbf{Frontal-Aware Filtering:} We \emph{perceive} face detection confidence in character references, \emph{reason} that back-view references may cause hallucinated faces, and \emph{act} by switching to text-based appearance description when confidence is low.
+\end{itemize}
+
+These mechanisms embody genuine agentic behavior---not just modular decomposition with agent-like naming, but active perception of generation outcomes, reasoning about quality and constraints, and adaptive action based on runtime observations.
+
+A final design choice reinforces our agentic flexibility: we adopt \textbf{subject-to-video (S2V)} generation~\cite{phantom} rather than keyframe + I2V pipelines. I2V treats the reference as the first frame, locking spatial composition and limiting camera diversity. S2V conditions on appearance \emph{without} constraining layout, giving the agentic system freedom to generate diverse shots while maintaining entity consistency.
+
+\vspace{0.5em}
+\noindent\textbf{Contributions.} We make the following contributions:
+
 \begin{enumerate}
-    \item A training-free \textbf{agentic pipeline} that maintains character visual consistency across multi-shot T2V generation without requiring external reference images.
-    \item A \textbf{post-generation grounding} paradigm, where entity crops are extracted from generated videos (not assumed available beforehand) using open-vocabulary detection and segmentation.
-    \item A \textbf{persistent Entity Registry} with Re-ID quality scoring that stores and retrieves the best visual references across shots.
-    \item An \textbf{LLM-driven entity parser} that performs cross-shot coreference resolution, ensuring semantic entity identity (e.g., ``the detective'' in shot~3 = ``Alex'' from shot~1) is maintained throughout the script.
+    \item \textbf{Agentic formulation:} We reframe multi-shot video generation as an agentic problem requiring explicit perception-reasoning-action loops, rather than a static pipeline.
+
+    \item \textbf{Grounding-in-the-Loop:} A self-bootstrapping paradigm where references are extracted from generated videos via visual grounding, ensuring stylistic consistency through agentic self-perception.
+
+    \item \textbf{Runtime agentic decisions:} Multiple perception-reasoning-action mechanisms---generation verification, subject-aware routing, lighting analysis, frontal-aware filtering---that actively adapt to generation outcomes.
+
+    \item \textbf{Training-free deployment:} Our method requires no training or fine-tuning, enabling immediate deployment on any compatible T2V/S2V backbone.
 \end{enumerate}
 
 % ============================================================================
