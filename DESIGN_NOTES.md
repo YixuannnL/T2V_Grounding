@@ -475,6 +475,154 @@ Scene: Interrogation room (lighting: fluorescent, harsh shadows, atmosphere: ten
 
 ---
 
+## 11. Smart Self-Improving Registry (v3.2)
+
+### 问题发现
+
+**场景**：处理一个 20 shot 的视频，包含 5 个 character + 3 个 location。
+
+**现象**：Registry 数据库膨胀到 480+ 条记录，大量低质量、冗余的参考图堆积。
+
+**数据证据**：
+```
+char_alex 参考图：
+  - Shot 1: 3 张 (score: 0.45, 0.52, 0.71)
+  - Shot 2: 3 张 (score: 0.48, 0.55, 0.68)
+  - ...
+  - Shot 20: 3 张 (score: 0.41, 0.49, 0.63)
+
+总计 60 张，其中 40+ 张质量相似、角度相似，完全冗余
+```
+
+### 根因分析
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  旧 Registry 设计缺陷：                                              │
+│                                                                     │
+│  1. 只注册不淘汰 —— 所有参考图永久保留                                │
+│  2. 无相似度检测 —— 相同角度的参考图重复注册                          │
+│  3. 无容量管理 —— 无上限，无优先级                                   │
+│  4. 查询时才过滤 —— 低质量数据仍占用存储和索引                        │
+│                                                                     │
+│  后果：                                                             │
+│  - 数据库膨胀                                                       │
+│  - 查询变慢                                                         │
+│  - 误选低质量参考的风险增加                                          │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 修复方案：SmartEntityRegistry
+
+引入 **Agentic 自优化参考图库**，核心改进：
+
+#### 1. 智能注册（注册时过滤）
+
+```python
+def register(entity_id, entry) -> (success, reason):
+    # Check 1: 质量门槛
+    if entry.quality_score < min_quality_to_register:
+        return False, "低于质量阈值"
+
+    # Check 2: 人脸置信度（character）
+    if entry.id_confidence < min_id_confidence:
+        return False, "人脸置信度不足"
+
+    # Check 3: 相似度去重（CLIP embedding）
+    if cosine_similarity(new, existing) > 0.92:
+        return False, "与已有参考图过于相似"
+
+    # Check 4: 同 shot 容量限制
+    if shot_count >= max_refs_per_shot:
+        if new.score > worst_in_shot.score:
+            evict(worst_in_shot)  # 替换
+        else:
+            return False, "同 shot 已满"
+
+    # Check 5: 总容量限制
+    if total_count >= max_refs_per_entity:
+        evict_lowest_quality()  # 淘汰最差的
+```
+
+#### 2. 主动淘汰机制
+
+```python
+class EvictionReason(Enum):
+    LOW_QUALITY = "low_quality"      # 质量分过低
+    REDUNDANT = "redundant"          # 与其他参考图过于相似
+    SUPERSEDED = "superseded"        # 被更高质量的替代
+
+def run_eviction_audit():
+    # 1. 淘汰低质量（保留锚点）
+    evict_below_threshold(quality < 0.5, protected=anchors)
+
+    # 2. 淘汰冗余（CLIP 相似度 > 0.92）
+    evict_redundant_by_similarity()
+```
+
+#### 3. 锚点保护机制
+
+```python
+# 自动提升为锚点的条件：
+is_anchor = (
+    quality_score >= 0.85 and      # 高质量
+    id_confidence >= 0.7 and       # 正脸
+    shot_id <= 3                   # 早期出现
+)
+
+# 锚点特权：
+# - 不会被自动淘汰
+# - 查询时优先返回
+# - 每个实体保护 2 个锚点
+```
+
+#### 4. 多样性管理
+
+```python
+# 姿态标签
+pose_tag: "frontal" | "three_quarter" | "profile" | "back"
+
+# 光线标签
+lighting_tag: "natural" | "bright" | "dim" | "backlit"
+
+# 确保保留不同姿态的参考图（用于不同镜头需求）
+min_pose_diversity = 2
+```
+
+#### 5. VLM 审计 Agent
+
+```python
+class ReferenceAuditAgent:
+    """
+    VLM 驱动的参考图质量审计
+    - 分析姿态、光线、清晰度
+    - 检测跨实体的标注错误
+    - 建议淘汰/保留
+    """
+```
+
+### 配置参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `min_quality_to_register` | 0.4 | 注册质量门槛 |
+| `max_refs_per_entity` | 10 | 每实体最大参考数 |
+| `max_refs_per_shot` | 2 | 每 shot 每实体最大数 |
+| `similarity_threshold` | 0.92 | CLIP 相似度去重阈值 |
+| `protected_anchor_count` | 2 | 每实体保护锚点数 |
+
+### 效果对比
+
+| 指标 | 旧 Registry | SmartRegistry |
+|------|-------------|---------------|
+| 20 shot 后参考图数量 | 480+ | ≤80 (8 实体 × 10) |
+| 冗余参考图 | 大量 | 自动去重 |
+| 查询性能 | 随时间下降 | 稳定 |
+| 锚点稳定性 | 无保护 | 自动保护 |
+| 审计能力 | 无 | VLM 驱动 |
+
+---
+
 ## 版本历史
 
 | 版本 | 日期 | 主要变更 |
@@ -485,6 +633,7 @@ Scene: Interrogation room (lighting: fluorescent, harsh shadows, atmosphere: ten
 | v2.5 | - | MLLM-based Generation Verification |
 | v3.0 | - | Agentic Reference Selection |
 | v3.1 | 2026-04-21 | Character-Aware Mode Routing |
+| v3.2 | 2026-04-21 | Smart Self-Improving Registry |
 
 ---
 

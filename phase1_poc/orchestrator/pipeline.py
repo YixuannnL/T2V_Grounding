@@ -40,6 +40,7 @@ from entity_parser.parser import EntityParser, ParseResult, Entity, EntityCountI
 from visual_grounding.referdino_grounder import ReferDINOGrounder, extract_frames, MultiEntityGroundingResult
 from visual_grounding.reid import ReferenceQualityScorer
 from reference_manager.registry import EntityRegistry, ReferenceEntry
+from reference_manager.smart_registry import SmartEntityRegistry, RegistryConfig, ReferenceEntry as SmartReferenceEntry
 from generator.ref2video import Reference2VideoGenerator, GenerationConfig
 from verification.entity_count_verifier import (
     EntityCountVerifier,
@@ -116,6 +117,10 @@ class T2VGroundingPipeline:
         # ── Agentic 参考图选择参数 ──
         ref_selection_mode: str = "traditional",  # "traditional" | "agent" | "hybrid"
         ref_selection_model: str = "claude-sonnet-4-6",  # Agent 使用的 VLM 模型
+        # ── SmartRegistry 参数 ──
+        use_smart_registry: bool = True,          # 是否使用智能 Registry（推荐开启）
+        registry_similarity_threshold: float = 0.92,  # CLIP 相似度去重阈值
+        registry_max_refs_per_shot: int = 2,      # 每 shot 每实体最多注册几张
     ):
         import torch
         import torch.distributed as dist
@@ -143,6 +148,12 @@ class T2VGroundingPipeline:
         self.ref_selection_model = ref_selection_model
         self._ref_selection_agent = None  # 延迟初始化
 
+        # SmartRegistry 参数
+        self.use_smart_registry = use_smart_registry
+        self.registry_similarity_threshold = registry_similarity_threshold
+        self.registry_max_refs_per_shot = registry_max_refs_per_shot
+        self._clip_model = None  # 延迟加载，用于相似度检测
+
         if self.is_rank0:
             for sub in ["frames", "crops", "videos", "registry", "selected_refs", "prompts", "used_refs"]:
                 os.makedirs(os.path.join(output_dir, sub), exist_ok=True)
@@ -153,9 +164,34 @@ class T2VGroundingPipeline:
         # LLM / Grounding / Registry 只在 rank 0 初始化
         if self.is_rank0:
             self.parser = EntityParser(model=llm_model)
-            self.registry = EntityRegistry(
-                os.path.join(output_dir, "registry", "entities.db")
-            )
+
+            # ── Registry 初始化（SmartRegistry vs 旧版）──
+            registry_db_path = os.path.join(output_dir, "registry", "entities.db")
+            if self.use_smart_registry:
+                # 使用智能 Registry：自动淘汰低质量/冗余参考图
+                smart_config = RegistryConfig(
+                    min_quality_to_register=self.min_ref_quality,
+                    min_id_confidence=self.min_face_confidence,
+                    max_refs_per_entity=self.max_refs_per_entity * 3,  # 允许更多，靠淘汰控制
+                    max_refs_per_shot=self.registry_max_refs_per_shot,
+                    similarity_threshold=self.registry_similarity_threshold,
+                    eviction_quality_threshold=self.min_ref_quality + 0.1,
+                    protected_anchor_count=2,
+                )
+                # 尝试加载 CLIP 模型用于相似度去重
+                clip_model = self._load_clip_model_if_available()
+                self.registry = SmartEntityRegistry(
+                    db_path=registry_db_path,
+                    config=smart_config,
+                    clip_model=clip_model,
+                )
+                print(f"[Pipeline] 🧠 SmartRegistry 已启用 | "
+                      f"max_per_shot={self.registry_max_refs_per_shot} | "
+                      f"similarity_threshold={self.registry_similarity_threshold}")
+            else:
+                # 使用旧版 Registry（只注册不淘汰）
+                self.registry = EntityRegistry(registry_db_path)
+                print(f"[Pipeline] 使用旧版 EntityRegistry（无淘汰机制）")
             if not self.mock_mode:
                 self.grounder = ReferDINOGrounder(device=device)
                 self.scorer = ReferenceQualityScorer(device=device)
@@ -200,6 +236,29 @@ class T2VGroundingPipeline:
                   f"mock={self.mock_mode} | world_size={self.world_size}")
             if self.ref_selection_mode != "traditional":
                 print(f"[Pipeline] 🤖 Agentic 参考图选择已启用 (mode={self.ref_selection_mode}, model={self.ref_selection_model})")
+
+    # ── CLIP 模型加载（用于 SmartRegistry 相似度去重）───────────────────────────
+
+    def _load_clip_model_if_available(self):
+        """
+        尝试加载 CLIP 模型用于参考图相似度检测
+
+        Returns:
+            (model, preprocess) tuple 或 None
+        """
+        try:
+            import clip
+            import torch
+            model, preprocess = clip.load("ViT-B/32", device=self.device)
+            model.eval()
+            print(f"[Pipeline] CLIP 模型已加载 (用于参考图去重)")
+            return (model, preprocess)
+        except ImportError:
+            print(f"[Pipeline] ⚠️ CLIP 未安装，参考图去重功能禁用 (pip install git+https://github.com/openai/CLIP.git)")
+            return None
+        except Exception as e:
+            print(f"[Pipeline] ⚠️ CLIP 加载失败: {e}，参考图去重功能禁用")
+            return None
 
     # ── Agentic 参考图选择 ─────────────────────────────────────────────────────
 
@@ -1152,7 +1211,14 @@ class T2VGroundingPipeline:
                     source="grounding",
                     id_confidence=float(id_conf),
                 )
-                self.registry.register(entity.entity_id, entry)
+
+                # SmartRegistry 返回 (success, reason)，旧版 Registry 返回 None
+                result = self.registry.register(entity.entity_id, entry)
+                if isinstance(result, tuple):
+                    success, reason = result
+                    if not success:
+                        print(f"[Pipeline] {entity.entity_id}: 注册被拒绝 - {reason}")
+                        continue
                 registered_paths.append(s.crop_path)
 
                 # 复制到 selected_refs/{entity_id}/shot{N}_score{X:.2f}.jpg
@@ -1161,9 +1227,21 @@ class T2VGroundingPipeline:
                 shutil.copy2(s.crop_path, os.path.join(selected_dir, dst_name))
 
             grounded[entity.entity_id] = registered_paths
-            print(f"[Pipeline] {entity.entity_id}: "
-                  f"入库 {len(registered_paths)} 张 "
-                  f"(best score={good[0].final_score:.3f})")
+            if registered_paths:
+                print(f"[Pipeline] {entity.entity_id}: "
+                      f"入库 {len(registered_paths)} 张 "
+                      f"(best score={good[0].final_score:.3f})")
+
+        # ── Step 5: 定期淘汰审计（SmartRegistry 专属）──────────────────────────
+        if self.use_smart_registry and hasattr(self.registry, 'run_eviction_audit'):
+            # 每 5 个 shot 运行一次淘汰审计
+            if shot_id % 5 == 0 and shot_id > 0:
+                eviction_results = self.registry.run_eviction_audit()
+                if eviction_results:
+                    total_evicted = sum(eviction_results.values())
+                    print(f"[Pipeline] 🗑️ 淘汰审计完成: 共淘汰 {total_evicted} 张冗余参考图")
+                    for eid, count in eviction_results.items():
+                        print(f"           {eid}: {count} 张")
 
         return grounded
 
@@ -1171,9 +1249,33 @@ class T2VGroundingPipeline:
 
     def _save_report(self, results: List[ShotResult]):
         report_path = os.path.join(self.output_dir, "pipeline_report.json")
+
+        # 基础统计
+        registry_stats = self.registry.stats()
+
+        # SmartRegistry 额外统计：淘汰日志
+        eviction_summary = None
+        if self.use_smart_registry and hasattr(self.registry, 'get_eviction_log'):
+            eviction_log = self.registry.get_eviction_log(limit=50)
+            eviction_summary = {
+                "total_evicted": registry_stats.get("evicted_references", 0),
+                "by_reason": registry_stats.get("eviction_by_reason", {}),
+                "recent_evictions": [
+                    {
+                        "entity_id": e.entity_id,
+                        "crop_path": e.crop_path,
+                        "reason": e.reason,
+                        "quality_score": e.quality_score,
+                    }
+                    for e in eviction_log[:10]  # 最近 10 条
+                ],
+            }
+
         report = {
             "total_shots": len(results),
-            "registry_stats": self.registry.stats(),
+            "registry_stats": registry_stats,
+            "eviction_summary": eviction_summary,
+            "smart_registry_enabled": self.use_smart_registry,
             "flow_summary": [
                 {
                     "shot_id": r.shot_id,
@@ -1188,3 +1290,10 @@ class T2VGroundingPipeline:
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(report, f, ensure_ascii=False, indent=2)
         print(f"\n[Pipeline] 报告已保存: {report_path}")
+
+        # 打印 SmartRegistry 摘要
+        if eviction_summary and eviction_summary["total_evicted"] > 0:
+            print(f"[Pipeline] 📊 SmartRegistry 统计:")
+            print(f"           活跃参考图: {registry_stats.get('active_references', 'N/A')}")
+            print(f"           已淘汰: {eviction_summary['total_evicted']}")
+            print(f"           淘汰原因分布: {eviction_summary['by_reason']}")

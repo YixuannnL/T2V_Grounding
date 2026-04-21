@@ -504,6 +504,35 @@ where:
     \item $q_{\text{inpaint}}$: Penalty for white/overexposed regions (artifacts from foreground removal)
 \end{itemize}
 
+\textbf{Agentic Self-Improving Registry.} A critical observation is that naive ``register-only'' registries accumulate unbounded reference entries across shots, leading to database bloat and degraded query performance. For a 20-shot video with 8 entities and 3 crops per entity per shot, this produces 480+ entries---many of which are low-quality, redundant, or superseded by better references.
+
+We introduce an \textbf{agentic self-improving registry} that actively manages its own state through intelligent registration, eviction, and diversity maintenance:
+
+\textbf{(1)~Smart Registration with Multi-Stage Filtering.} Rather than accepting all grounding results, the registry applies a cascade of filters at registration time:
+\begin{itemize}
+    \item \textbf{Quality gate:} Reject entries with $q < \tau_{\text{min}}$ (default 0.4)
+    \item \textbf{Face confidence gate (characters):} Reject entries with $\text{id\_conf} < \tau_{\text{face}}$ (default 0.3)
+    \item \textbf{Similarity deduplication:} Compute CLIP embeddings and reject entries with cosine similarity $> \tau_{\text{sim}}$ (default 0.92) to existing references
+    \item \textbf{Per-shot capacity:} Limit to $k_{\text{shot}}$ entries per entity per shot (default 2)
+    \item \textbf{Total capacity:} Limit to $k_{\text{total}}$ entries per entity (default 10)
+\end{itemize}
+
+\textbf{(2)~Quality-Competitive Eviction.} When capacity limits are reached, the registry makes agentic eviction decisions:
+\begin{equation}
+\text{evict}(e) = \begin{cases}
+r_{\text{lowest}} & \text{if } q(r_{\text{lowest}}) < \tau_{\text{evict}} \\
+r_{\text{lowest}} & \text{if } q_{\text{new}} > q(r_{\text{lowest}}) \\
+\text{reject new} & \text{otherwise}
+\end{cases}
+\end{equation}
+where $r_{\text{lowest}}$ is the lowest-quality non-anchor reference. This ensures that higher-quality references can always replace lower-quality ones, even when the registry is at capacity.
+
+\textbf{(3)~Anchor Protection.} References that meet anchor criteria (high quality, frontal face, early shot) are automatically promoted to protected status and excluded from eviction. Each entity maintains up to 2 protected anchors.
+
+\textbf{(4)~Periodic Audit.} Every 5 shots, the registry runs an eviction audit that removes low-quality entries below $\tau_{\text{evict}}$ and deduplicates similar references, maintaining a diverse, high-quality reference pool.
+
+The agentic registry reduces storage by $\sim$80\% compared to naive accumulation while improving average reference quality, with negligible runtime overhead ($<$2\% of generation time for CLIP similarity computation).
+
 An important property: the registry accumulates references \textbf{across shots}. By shot $n$, the registry contains references extracted from $v_1, \ldots, v_{n-1}$, meaning each subsequent shot benefits from progressively more diverse reference images. However, due to the anchor strategies, character references are drawn from early high-quality shots, and location references balance early consistency with quality awareness.
 
 % ----------------------------------------------------------------------------
