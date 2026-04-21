@@ -161,6 +161,80 @@ class LLMClient:
         )
         return response.choices[0].message.content
 
+    # ── 多模态对话（支持图片）──────────────────────────────────────────────────
+    def chat_with_images(
+        self,
+        content_parts: List[dict],
+        system: str = "",
+        model: Optional[str] = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.3,
+    ) -> str:
+        """
+        多模态对话，支持图片输入
+
+        Args:
+            content_parts: 内容列表，每个元素是:
+                - {"type": "text", "text": "..."}
+                - {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "..."}}
+            system: 系统提示词
+            model: 模型名（可选）
+            max_tokens: 最大输出 token
+            temperature: 温度参数
+
+        Returns:
+            模型回复文本
+        """
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+
+        # 构建 OpenAI 格式的多模态消息
+        # OpenAI 格式: content 是列表，每个元素有 type 字段
+        openai_content = []
+        for part in content_parts:
+            if part["type"] == "text":
+                openai_content.append({
+                    "type": "text",
+                    "text": part["text"]
+                })
+            elif part["type"] == "image":
+                # 将 Anthropic 格式转换为 OpenAI 格式
+                source = part.get("source", {})
+                if source.get("type") == "base64":
+                    media_type = source.get("media_type", "image/jpeg")
+                    data = source.get("data", "")
+                    openai_content.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{media_type};base64,{data}"
+                        }
+                    })
+                elif source.get("type") == "url":
+                    openai_content.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": source.get("url", "")
+                        }
+                    })
+
+        messages.append({"role": "user", "content": openai_content})
+
+        for attempt in range(5):
+            try:
+                response = self.client.chat.completions.create(
+                    model=_resolve_model(model) if model else self.model,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                return response.choices[0].message.content
+            except RateLimitError as e:
+                wait = 15 * (2 ** attempt)
+                print(f"[LLMClient] 429 限流，{wait}s 后重试 (attempt {attempt+1}/5): {e}")
+                time.sleep(wait)
+        raise RuntimeError("[LLMClient] 达到最大重试次数，API 持续限流")
+
     # ── 工具调用（Function Calling）────────────────────────────────────────────
     def chat_with_tools(
         self,

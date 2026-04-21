@@ -57,6 +57,12 @@ from orchestrator.agentic_scheduler import (
     ShotType,
     visualize_schedule,
 )
+from verification.video_critic import (
+    VideoQualityCritic,
+    CritiqueResult,
+    RepairStrategyGenerator,
+    IssueSeverity,
+)
 
 
 @dataclass
@@ -133,6 +139,12 @@ class T2VGroundingPipeline:
         enable_dag_scheduling: bool = True,       # 是否启用 DAG 调度优化（推荐开启）
         dag_scheduling_model: str = "claude-sonnet-4-6-Anthropic",  # DAG 调度使用的 LLM
         dag_min_benefit_threshold: float = 0.15,  # DAG 优化最小收益阈值
+        # ── Self-Critique 参数 ──
+        enable_self_critique: bool = True,        # 是否启用 Self-Critique（默认开启）
+        critique_model: str = "claude-sonnet-4-6-Anthropic",  # Critique 使用的 VLM
+        critique_pass_threshold: float = 0.7,     # Critique 通过阈值
+        critique_max_retries: int = 2,            # Critique 失败后最大重试次数
+        critique_sample_frames: int = 5,          # Critique 采样帧数
     ):
         import torch
         import torch.distributed as dist
@@ -171,6 +183,14 @@ class T2VGroundingPipeline:
         self.dag_scheduling_model = dag_scheduling_model
         self.dag_min_benefit_threshold = dag_min_benefit_threshold
         self._scheduler = None  # 延迟初始化
+
+        # ── Self-Critique 参数 ──
+        self.enable_self_critique = enable_self_critique
+        self.critique_model = critique_model
+        self.critique_pass_threshold = critique_pass_threshold
+        self.critique_max_retries = critique_max_retries
+        self.critique_sample_frames = critique_sample_frames
+        self._video_critic = None  # 延迟初始化
 
         if self.is_rank0:
             for sub in ["frames", "crops", "videos", "registry", "selected_refs", "prompts", "used_refs"]:
@@ -256,6 +276,8 @@ class T2VGroundingPipeline:
                 print(f"[Pipeline] 🤖 Agentic 参考图选择已启用 (mode={self.ref_selection_mode}, model={self.ref_selection_model})")
             if self.enable_dag_scheduling:
                 print(f"[Pipeline] 📊 DAG 调度优化已启用 (model={self.dag_scheduling_model})")
+            if self.enable_self_critique:
+                print(f"[Pipeline] 🔍 Self-Critique 已启用 (model={self.critique_model}, threshold={self.critique_pass_threshold})")
 
     # ── CLIP 模型加载（用于 SmartRegistry 相似度去重）───────────────────────────
 
@@ -317,6 +339,24 @@ class T2VGroundingPipeline:
                 print(f"[Pipeline] 回退到传统参考图选择模式")
                 self.ref_selection_mode = "traditional"
         return self._ref_selection_agent
+
+    @property
+    def video_critic(self):
+        """获取视频质量评审专家（延迟初始化）"""
+        if self._video_critic is None and self.enable_self_critique:
+            try:
+                self._video_critic = VideoQualityCritic(
+                    model=self.critique_model,
+                    pass_threshold=self.critique_pass_threshold,
+                    sample_frames=self.critique_sample_frames,
+                    verbose=True,
+                )
+                print(f"[Pipeline] VideoQualityCritic 初始化成功")
+            except Exception as e:
+                print(f"[Pipeline] ⚠️ VideoQualityCritic 初始化失败: {e}")
+                print(f"[Pipeline] Self-Critique 功能已禁用")
+                self.enable_self_critique = False
+        return self._video_critic
 
     def _agent_select_reference(
         self,
@@ -1060,6 +1100,24 @@ class T2VGroundingPipeline:
             )
             verification_metadata = {"verified": False}
 
+        # ── Step 3.5: Self-Critique 循环（生成后、grounding 前）─────────────────
+        critique_metadata = {"critique_enabled": False}
+        if self.is_rank0 and self.enable_self_critique and not self.mock_mode:
+            # 只有使用了参考图时才进行 Critique（T2V 无参考图，没有对比基准）
+            if all_ref_paths and generation_mode == "phantom":
+                video_path, critique_metadata = self._generate_with_critique(
+                    shot=shot,
+                    prompt=prompt,
+                    all_ref_images=all_ref_images,
+                    all_ref_paths=all_ref_paths,
+                    video_path=video_path,
+                    parse_result=parse_result,
+                    reference_used=reference_used,
+                )
+            else:
+                if self.is_rank0:
+                    print(f"[Pipeline] Self-Critique 跳过: {'无参考图' if not all_ref_paths else 'T2V模式'}")
+
         # ── Step 4: rank 0 做 grounding → 入库 ───────────────────────────────
         if not self.is_rank0:
             return None
@@ -1088,6 +1146,7 @@ class T2VGroundingPipeline:
             metadata={
                 "gen_prompt": prompt,
                 "verification": verification_metadata,
+                "critique": critique_metadata,
             },
         )
 
@@ -1206,6 +1265,211 @@ class T2VGroundingPipeline:
         }
 
         return video_path, metadata
+
+    # ── Self-Critique 循环 ────────────────────────────────────────────────────
+
+    def _generate_with_critique(
+        self,
+        shot: ShotConfig,
+        prompt: str,
+        all_ref_images: List[Image.Image],
+        all_ref_paths: List[str],
+        video_path: str,
+        parse_result: ParseResult,
+        reference_used: dict,
+    ) -> tuple:
+        """
+        带 Self-Critique 的生成循环
+
+        流程:
+          1. 视频已生成（首次生成在调用此函数前完成）
+          2. VLM Critique 分析视频与参考图的一致性
+          3. 如果发现严重问题，根据建议调整参数重新生成
+          4. 最多重试 critique_max_retries 次
+
+        Args:
+            shot: 当前镜头配置
+            prompt: 生成 prompt
+            all_ref_images: 参考图 PIL 列表
+            all_ref_paths: 参考图路径列表
+            video_path: 已生成的视频路径
+            parse_result: 实体解析结果
+            reference_used: 使用的参考图 {entity_id: [paths]}
+
+        Returns:
+            (final_video_path, critique_metadata)
+        """
+        print(f"\n[Critique] ── 开始 Self-Critique 循环 (Shot {shot.shot_id}) ──")
+
+        critique_history = []
+        repair_generator = RepairStrategyGenerator()
+
+        # 准备实体信息
+        expected_entities = [
+            {
+                "entity_id": e.entity_id,
+                "type": e.type,
+                "text_description": e.text_description,
+            }
+            for e in parse_result.entities
+            if e.grounding_priority in ("high", "medium")
+        ]
+
+        # 准备实体数量预期
+        entity_counts = [
+            {
+                "entity_type": ec.entity_type,
+                "expected_count": ec.expected_count,
+            }
+            for ec in parse_result.entity_counts
+        ] if parse_result.entity_counts else None
+
+        # 当前生成参数（用于修复策略）
+        current_params = {
+            "ip_adapter_scale": self.generator.config.guide_scale_img,
+            "guide_scale_text": self.generator.config.guide_scale_text,
+            "num_inference_steps": self.generator.config.num_inference_steps,
+            "seed": self.generator.config.seed,
+        }
+
+        final_video_path = video_path
+        best_score = 0.0
+        best_video_path = video_path
+
+        for attempt in range(self.critique_max_retries + 1):
+            # Step 1: 调用 VLM Critique
+            print(f"[Critique] 尝试 {attempt + 1}/{self.critique_max_retries + 1}: 分析视频...")
+
+            critique_result = self.video_critic.critique(
+                video_path=final_video_path,
+                reference_images=reference_used,
+                expected_entities=expected_entities,
+                shot_text=shot.text,
+                entity_counts=entity_counts,
+            )
+
+            # 记录历史
+            critique_history.append({
+                "attempt": attempt + 1,
+                "score": critique_result.overall_score,
+                "passed": critique_result.passed,
+                "num_issues": len(critique_result.issues),
+                "critical_issues": len(critique_result.critical_issues),
+                "high_issues": len(critique_result.high_issues),
+                "params": current_params.copy(),
+                "suggestions": [
+                    {"action": s.action, "target": s.target, "detail": s.detail}
+                    for s in critique_result.suggestions[:3]
+                ],
+            })
+
+            # 记录最佳结果
+            if critique_result.overall_score > best_score:
+                best_score = critique_result.overall_score
+                best_video_path = final_video_path
+
+            # Step 2: 判断是否通过
+            if critique_result.passed:
+                print(f"[Critique] ✅ 通过！分数: {critique_result.overall_score:.2f}")
+                break
+
+            # Step 3: 未通过，检查是否还有重试机会
+            if attempt >= self.critique_max_retries:
+                print(f"[Critique] ⚠️ 达到最大重试次数，使用最佳结果 (score={best_score:.2f})")
+                final_video_path = best_video_path
+                break
+
+            # Step 4: 根据 Critique 建议调整参数
+            print(f"[Critique] ❌ 未通过 (score={critique_result.overall_score:.2f})，准备修复...")
+
+            # 打印主要问题
+            for issue in critique_result.issues[:3]:
+                icon = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}.get(
+                    issue.severity.value, "⚪"
+                )
+                print(f"[Critique]    {icon} {issue.description}")
+
+            # 生成修复参数
+            new_params = repair_generator.generate_repair_params(
+                critique_result=critique_result,
+                current_params=current_params,
+            )
+
+            # 检查是否需要强制切换 T2V
+            if new_params.get("force_t2v"):
+                print(f"[Critique] 建议切换到 T2V 模式，但本次保留 S2V，仅调整参数")
+                del new_params["force_t2v"]
+
+            # 更新参数
+            params_changed = []
+            if new_params.get("ip_adapter_scale") != current_params.get("ip_adapter_scale"):
+                old_val = current_params.get("ip_adapter_scale", 0)
+                new_val = new_params["ip_adapter_scale"]
+                self.generator.config.guide_scale_img = new_val
+                params_changed.append(f"ip_adapter_scale: {old_val:.2f} → {new_val:.2f}")
+
+            if new_params.get("num_inference_steps") != current_params.get("num_inference_steps"):
+                old_val = current_params.get("num_inference_steps", 50)
+                new_val = new_params["num_inference_steps"]
+                self.generator.config.num_inference_steps = new_val
+                params_changed.append(f"steps: {old_val} → {new_val}")
+
+            # 换 seed
+            if new_params.get("seed") != current_params.get("seed"):
+                new_seed = new_params["seed"]
+                self.generator.config.seed = new_seed
+                params_changed.append(f"seed → {new_seed}")
+            else:
+                # 即使没有建议换 seed，也自动换一个以增加多样性
+                import random
+                new_seed = self.base_seed + shot.shot_id + (attempt + 1) * 1000 + random.randint(0, 999)
+                self.generator.config.seed = new_seed
+                new_params["seed"] = new_seed
+                params_changed.append(f"seed → {new_seed} (auto)")
+
+            current_params = new_params
+
+            if params_changed:
+                print(f"[Critique] 参数调整: {', '.join(params_changed)}")
+
+            # Step 5: 重新生成视频
+            retry_video_path = os.path.join(
+                self.output_dir, "videos",
+                f"shot_{shot.shot_id:03d}_critique_retry{attempt + 1}.mp4"
+            )
+
+            print(f"[Critique] 重新生成视频...")
+            self.generator.generate(
+                text_prompt=prompt,
+                references=all_ref_images,
+                output_path=retry_video_path,
+            )
+
+            final_video_path = retry_video_path
+
+        # 构建元数据
+        critique_metadata = {
+            "critique_enabled": True,
+            "final_attempt": len(critique_history),
+            "final_score": critique_history[-1]["score"] if critique_history else 0,
+            "final_passed": critique_history[-1]["passed"] if critique_history else False,
+            "best_score": best_score,
+            "critique_history": critique_history,
+        }
+
+        # 如果最终使用的不是最佳视频，复制最佳视频为最终输出
+        if final_video_path != best_video_path and best_score > critique_history[-1]["score"]:
+            import shutil
+            final_output = os.path.join(
+                self.output_dir, "videos", f"shot_{shot.shot_id:03d}.mp4"
+            )
+            shutil.copy2(best_video_path, final_output)
+            final_video_path = final_output
+            print(f"[Critique] 使用最佳结果 (score={best_score:.2f})")
+
+        print(f"[Critique] ── Self-Critique 完成 (最终分数: {best_score:.2f}) ──\n")
+
+        return final_video_path, critique_metadata
 
     # ── 生成后 Grounding & 入库 ───────────────────────────────────────────────
 

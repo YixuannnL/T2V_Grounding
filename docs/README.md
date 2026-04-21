@@ -1396,3 +1396,143 @@ agentic:
 | **场景参考** | 清晰度评分 | 理解光线、构图匹配度 |
 
 ---
+
+## Self-Critique & Reflection Loop（v4.0 新增）
+
+### 背景问题
+
+传统的视频质量评估只用 CLIP 相似度打分（如 0.65），存在以下问题：
+- **只知道"分数低"，不知道"为什么低"**
+- Agent 只能盲目重试，没有针对性修复策略
+- 重试多次可能都在猜测，浪费计算资源
+
+### 解决方案：VLM Self-Critique
+
+引入 VLM（Claude）作为"评审专家"，对生成的视频进行深度分析：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  Self-Critique 循环                         │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. 生成视频                                                │
+│     ↓                                                       │
+│  2. VLM Critique 分析（对比参考图）                          │
+│     │  - 身份一致性：面部特征、发型、肤色                     │
+│     │  - 服装一致性：款式、颜色、配饰                        │
+│     │  - 光线一致性：方向、色温、阴影                        │
+│     │  - 实体完整性：人数、物体是否缺失                      │
+│     │  - 风格一致性：真实感 vs 动画化                        │
+│     ↓                                                       │
+│  3. 发现问题 → 生成具体修复建议                              │
+│     │  - "胡子形状从络腮胡变成山羊胡"                        │
+│     │  - "建议增大 ip_adapter_scale 到 0.85"                │
+│     ↓                                                       │
+│  4. 应用修复策略 → 重新生成                                  │
+│     ↓                                                       │
+│  5. 循环直到通过或达到最大重试次数                           │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 配置参数
+
+```python
+pipeline = T2VGroundingPipeline(
+    # Self-Critique 参数（默认开启）
+    enable_self_critique=True,           # 是否启用
+    critique_model="claude-sonnet-4-6",  # VLM 模型
+    critique_pass_threshold=0.7,         # 通过阈值
+    critique_max_retries=2,              # 最大重试次数
+    critique_sample_frames=5,            # 采样帧数
+)
+```
+
+**关闭 Self-Critique**（如需节省 API 调用）：
+```python
+pipeline = T2VGroundingPipeline(
+    enable_self_critique=False,
+    # ...
+)
+```
+
+### 问题严重程度分级
+
+| 级别 | 标识 | 定义 | 示例 |
+|------|------|------|------|
+| **critical** | 🔴 | 严重破坏一致性，必须修复 | 人脸完全不像、人数错误、风格动画化 |
+| **high** | 🟠 | 明显影响观感，强烈建议修复 | 发型大变、衣服颜色明显不同 |
+| **medium** | 🟡 | 有差异但可接受 | 细微表情差异、轻微色调偏移 |
+| **low** | 🟢 | 几乎不影响 | 背景细节变化、极细微纹理差异 |
+
+### 修复策略类型
+
+| 策略 | 目标参数 | 适用场景 |
+|------|----------|----------|
+| `increase_ip_adapter_scale` | ip_adapter_scale ↑ | 身份/外观不一致 |
+| `decrease_ip_adapter_scale` | ip_adapter_scale ↓ | 姿态受限、动作僵硬 |
+| `change_reference` | 参考图选择 | 参考图角度/质量不佳 |
+| `add_prompt_detail` | prompt | 缺少细节描述 |
+| `adjust_lighting_prompt` | prompt | 光线不一致 |
+| `increase_inference_steps` | num_inference_steps ↑ | 画质/细节不足 |
+| `change_seed` | seed | 尝试不同生成 |
+| `use_t2v_fallback` | 生成模式 | S2V 效果差，建议切换 |
+
+### 输出示例
+
+```
+[Critique] ── 开始 Self-Critique 循环 (Shot 2) ──
+[Critic] 开始分析视频: output/videos/shot_002.mp4
+[Critic] 采样 5 帧 (总帧数: 81)
+[Critic] 加载参考图: ['char_alex']
+[Critic] 评分: 0.58 | ❌ 需要修复
+[Critic] 发现 2 个问题:
+         🟠 [high] 胡子形状从络腮胡变成山羊胡
+         🟡 [medium] 肤色偏白，参考图偏黑
+[Critic] 修复建议:
+         1. increase_ip_adapter_scale: 从 0.6 增加到 0.85
+         2. add_prompt_detail: 在 prompt 中添加 'full beard'
+
+[Critique] ❌ 未通过 (score=0.58)，准备修复...
+[Critique]    🟠 胡子形状从络腮胡变成山羊胡
+[Critique]    🟡 肤色偏白，参考图偏黑
+[Critique] 参数调整: ip_adapter_scale: 0.60 → 0.75, seed → 43521
+[Critique] 重新生成视频...
+
+[Critique] 尝试 2/3: 分析视频...
+[Critic] 评分: 0.78 | ✅ 通过
+[Critique] ✅ 通过！分数: 0.78
+[Critique] ── Self-Critique 完成 (最终分数: 0.78) ──
+```
+
+### 文件结构
+
+```
+phase1_poc/
+├── verification/
+│   ├── __init__.py
+│   ├── entity_count_verifier.py    # Shot 1 人数验证
+│   └── video_critic.py             # 【v4.0 新增】Self-Critique VLM 评审
+```
+
+### 关键类
+
+```python
+# 主要类
+class VideoQualityCritic:
+    """VLM 视频质量评审专家"""
+    def critique(video_path, reference_images, expected_entities, ...) -> CritiqueResult
+
+class CritiqueResult:
+    """Critique 结果"""
+    overall_score: float      # 综合评分 0-1
+    passed: bool              # 是否通过
+    issues: List[CritiqueIssue]         # 发现的问题
+    suggestions: List[RepairSuggestion]  # 修复建议
+
+class RepairStrategyGenerator:
+    """将 Critique 建议转化为具体参数调整"""
+    def generate_repair_params(critique_result, current_params) -> dict
+```
+
+---

@@ -16,6 +16,8 @@
 8. [Cross-Entity IoU Deduplication](#8-cross-entity-iou-deduplication)
 9. [Agentic Reference Selection (v3.0)](#9-agentic-reference-selection-v30)
 10. [Environment Context Injection](#10-environment-context-injection)
+11. [Smart Self-Improving Registry (v3.2)](#11-smart-self-improving-registry-v32)
+12. [Self-Critique & Reflection Loop (v4.0)](#12-self-critique--reflection-loop-v40)
 
 ---
 
@@ -623,6 +625,243 @@ class ReferenceAuditAgent:
 
 ---
 
+## 12. Self-Critique & Reflection Loop (v4.0)
+
+### 问题发现
+
+**场景**：Shot 1 prompt 描述 "blonde woman with blue eyes"，T2V 生成了 "brown-haired woman with dark eyes"。
+
+**现象**：传统 Generation-Verification Loop (v2.5) 只验证人数，无法检测细粒度的属性偏差（发色、服装、场景氛围等）。
+
+**数据证据**：
+```
+Shot 1 prompt: "A blonde woman in a white coat walks through a golden-lit opulent room"
+Generated video:
+  - ✅ 人数正确 (1 人)
+  - ❌ 发色错误 (brown vs blonde)
+  - ❌ 服装不符 (black coat vs white coat)
+  - ❌ 场景偏差 (modern office vs opulent room)
+```
+
+### 根因分析
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  v2.5 验证局限：                                                     │
+│                                                                     │
+│  1. 只检查人数 —— 忽略外观属性（发色、服装、表情）                      │
+│  2. 无法评估场景一致性 —— 光线、氛围、背景                            │
+│  3. 无法关联 Shot 间漂移 —— 同一角色跨 Shot 外观变化                   │
+│  4. 输出是 pass/fail —— 无法指导修复方向                             │
+│                                                                     │
+│  后果：                                                             │
+│  - 细节偏差无法检测                                                  │
+│  - 错误参考图被锚定，传播到后续所有 shot                               │
+│  - 修复只能靠换 seed 碰运气                                          │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 修复方案：Self-Critique & Reflection Loop
+
+引入 **VLM 驱动的视频质量分析器**，不仅检测问题，还输出针对性修复建议。
+
+#### 1. 架构设计
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      Self-Critique 反馈循环                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│   Shot Prompt + Reference Images                                    │
+│        │                                                            │
+│        ▼                                                            │
+│   ┌──────────┐     ┌──────────────┐     ┌─────────────────┐        │
+│   │ T2V/S2V  │ ──▶ │ VideoQuality │ ──▶ │ RepairStrategy  │        │
+│   │ Generate │     │   Critic     │     │   Generator     │        │
+│   └──────────┘     └──────────────┘     └─────────────────┘        │
+│        ▲                  │                     │                   │
+│        │                  ▼                     ▼                   │
+│        │           ┌──────────────┐     ┌─────────────────┐        │
+│        └────────── │ Pass? score  │ NO  │ Adjusted Params │        │
+│                    │   >= 0.7     │ ──▶ │ (prompt, seed,  │        │
+│                    └──────────────┘     │  guidance, etc) │        │
+│                          │              └─────────────────┘        │
+│                         YES                                        │
+│                          ▼                                         │
+│                    ┌──────────────┐                                │
+│                    │ Accept Video │                                │
+│                    └──────────────┘                                │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 2. VideoQualityCritic 核心类
+
+```python
+class VideoQualityCritic:
+    """
+    VLM 驱动的视频质量评估器
+    - 多帧采样分析
+    - 细粒度问题检测
+    - 可操作的修复建议
+    """
+    def critique(
+        video_path: str,
+        shot_prompt: str,
+        reference_images: Dict[str, str],  # entity_id -> image_path
+        sample_frames: int = 5,
+    ) -> CritiqueResult
+```
+
+#### 3. 问题类型分类 (IssueType)
+
+| 类型 | 描述 | 示例 |
+|------|------|------|
+| `identity_mismatch` | 整体身份不匹配 | 完全不同的人 |
+| `facial_feature_mismatch` | 面部特征偏差 | 发色、眼色、脸型 |
+| `clothing_mismatch` | 服装不一致 | 白大衣变黑夹克 |
+| `pose_mismatch` | 姿态不符预期 | 站立变坐着 |
+| `expression_mismatch` | 表情偏差 | 微笑变严肃 |
+| `scene_mismatch` | 场景/背景不符 | 办公室变街道 |
+| `lighting_mismatch` | 光线色调偏差 | 金色暖光变冷白光 |
+| `style_drift` | 风格漂移 | 真实变动画 |
+| `motion_issue` | 动作/运动问题 | 不自然的运动 |
+| `quality_issue` | 画质问题 | 模糊、伪影 |
+
+#### 4. 严重程度分级 (IssueSeverity)
+
+```python
+class IssueSeverity(Enum):
+    CRITICAL = "critical"  # 必须修复（identity 错误）
+    HIGH = "high"          # 强烈建议修复
+    MEDIUM = "medium"      # 建议修复
+    LOW = "low"            # 可接受
+```
+
+#### 5. CritiqueResult 输出结构
+
+```python
+@dataclass
+class CritiqueResult:
+    passed: bool              # overall_score >= threshold
+    overall_score: float      # 0.0 - 1.0
+    issues: List[CritiqueIssue]
+    frame_analyses: List[FrameAnalysis]
+    repair_suggestions: List[RepairSuggestion]
+    summary: str              # 人类可读的总结
+```
+
+#### 6. RepairSuggestion 修复建议
+
+```python
+@dataclass
+class RepairSuggestion:
+    issue_type: IssueType
+    strategy: str             # "enhance_prompt" | "change_seed" | ...
+    priority: int             # 1 = 最高
+    prompt_addition: str      # 增强 prompt 的文本
+    parameter_adjustments: Dict[str, Any]  # seed, guidance_scale 等
+    rationale: str
+```
+
+#### 7. RepairStrategyGenerator
+
+将 VLM 的建议转换为具体的生成参数：
+
+```python
+class RepairStrategyGenerator:
+    def generate_repair_params(
+        original_params: Dict,
+        critique_result: CritiqueResult,
+    ) -> Dict:
+        # 根据问题类型选择策略
+        for suggestion in critique_result.repair_suggestions:
+            if suggestion.strategy == "enhance_prompt":
+                params["prompt"] = enhance_prompt(original, suggestion)
+            elif suggestion.strategy == "change_seed":
+                params["seed"] = generate_new_seed()
+            elif suggestion.strategy == "adjust_guidance":
+                params["guidance_scale"] = adjust_guidance(suggestion)
+```
+
+### VLM Prompt 示例
+
+```
+Analyze this video frame for consistency with the expected description.
+
+## Expected Description
+"A blonde woman in a white coat walks through a golden-lit opulent room"
+
+## Reference Images
+[Images attached]
+
+## Analysis Requirements
+1. Character consistency (face, hair, clothing)
+2. Scene consistency (environment, lighting, atmosphere)
+3. Pose and action accuracy
+4. Overall visual quality
+
+Provide structured analysis...
+```
+
+### 配置参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `enable_self_critique` | `True` | 是否启用 |
+| `critique_model` | `claude-sonnet-4-6-Anthropic` | VLM 模型 |
+| `critique_pass_threshold` | `0.7` | 通过阈值 |
+| `critique_max_retries` | `2` | 最大重试次数 |
+| `critique_sample_frames` | `5` | 采样帧数 |
+
+### Pipeline 集成
+
+```python
+# orchestrator/pipeline.py
+class ShotPipeline:
+    def __init__(self, ..., enable_self_critique: bool = True):
+        self.enable_self_critique = enable_self_critique
+
+    def _process_shot(self, shot):
+        video_path = self._generate_video(shot)
+
+        if self.enable_self_critique:
+            video_path = self._generate_with_critique(
+                shot, video_path,
+                max_retries=self.critique_max_retries
+            )
+
+        # 继续 grounding...
+```
+
+### 效果对比
+
+| 指标 | 旧方案 (v2.5) | Self-Critique (v4.0) |
+|------|---------------|----------------------|
+| 检测维度 | 人数 | 外观、场景、光线、风格 |
+| 问题定位 | 无 | 具体实体 + 属性 |
+| 修复指导 | 换 seed | 针对性参数调整 |
+| 输出格式 | pass/fail | 结构化 JSON |
+| 可解释性 | 无 | 详细分析报告 |
+
+### 日志示例
+
+```
+[Self-Critique] Shot 1 分析:
+  Overall Score: 0.55 (未通过, 阈值 0.7)
+  Issues:
+    - [CRITICAL] identity_mismatch (char_alex): 发色不匹配 (brown vs blonde)
+    - [HIGH] clothing_mismatch (char_alex): 服装不匹配 (black vs white coat)
+  Repair Suggestions:
+    - enhance_prompt: 添加 "[exactly blonde hair, white coat]"
+    - change_seed: 更换随机种子
+
+[Self-Critique] Shot 1 重试 1/2...
+[Self-Critique] Shot 1 通过 (score=0.82)
+```
+
+---
+
 ## 版本历史
 
 | 版本 | 日期 | 主要变更 |
@@ -634,6 +873,7 @@ class ReferenceAuditAgent:
 | v3.0 | - | Agentic Reference Selection |
 | v3.1 | 2026-04-21 | Character-Aware Mode Routing |
 | v3.2 | 2026-04-21 | Smart Self-Improving Registry |
+| v4.0 | 2026-04-21 | Self-Critique & Reflection Loop |
 
 ---
 
