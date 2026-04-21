@@ -49,6 +49,14 @@ from verification.entity_count_verifier import (
     VerificationStatus,
     build_count_enhanced_prompt,
 )
+from orchestrator.agentic_scheduler import (
+    AgenticScheduler,
+    ScheduleResult,
+    ShotInfo,
+    EntityInfo,
+    ShotType,
+    visualize_schedule,
+)
 
 
 @dataclass
@@ -121,6 +129,10 @@ class T2VGroundingPipeline:
         use_smart_registry: bool = True,          # 是否使用智能 Registry（推荐开启）
         registry_similarity_threshold: float = 0.92,  # CLIP 相似度去重阈值
         registry_max_refs_per_shot: int = 2,      # 每 shot 每实体最多注册几张
+        # ── Agentic Scheduling 参数 ──
+        enable_dag_scheduling: bool = True,       # 是否启用 DAG 调度优化（推荐开启）
+        dag_scheduling_model: str = "claude-sonnet-4-6-Anthropic",  # DAG 调度使用的 LLM
+        dag_min_benefit_threshold: float = 0.15,  # DAG 优化最小收益阈值
     ):
         import torch
         import torch.distributed as dist
@@ -153,6 +165,12 @@ class T2VGroundingPipeline:
         self.registry_similarity_threshold = registry_similarity_threshold
         self.registry_max_refs_per_shot = registry_max_refs_per_shot
         self._clip_model = None  # 延迟加载，用于相似度检测
+
+        # ── Agentic Scheduling 参数 ──
+        self.enable_dag_scheduling = enable_dag_scheduling
+        self.dag_scheduling_model = dag_scheduling_model
+        self.dag_min_benefit_threshold = dag_min_benefit_threshold
+        self._scheduler = None  # 延迟初始化
 
         if self.is_rank0:
             for sub in ["frames", "crops", "videos", "registry", "selected_refs", "prompts", "used_refs"]:
@@ -236,6 +254,8 @@ class T2VGroundingPipeline:
                   f"mock={self.mock_mode} | world_size={self.world_size}")
             if self.ref_selection_mode != "traditional":
                 print(f"[Pipeline] 🤖 Agentic 参考图选择已启用 (mode={self.ref_selection_mode}, model={self.ref_selection_model})")
+            if self.enable_dag_scheduling:
+                print(f"[Pipeline] 📊 DAG 调度优化已启用 (model={self.dag_scheduling_model})")
 
     # ── CLIP 模型加载（用于 SmartRegistry 相似度去重）───────────────────────────
 
@@ -261,6 +281,24 @@ class T2VGroundingPipeline:
             return None
 
     # ── Agentic 参考图选择 ─────────────────────────────────────────────────────
+
+    @property
+    def scheduler(self):
+        """获取 DAG 调度器（延迟初始化）"""
+        if self._scheduler is None and self.enable_dag_scheduling:
+            try:
+                self._scheduler = AgenticScheduler(
+                    model=self.dag_scheduling_model,
+                    min_benefit_threshold=self.dag_min_benefit_threshold,
+                    enable_heuristic_fallback=True,
+                    verbose=True,
+                )
+                print(f"[Pipeline] AgenticScheduler 初始化成功")
+            except Exception as e:
+                print(f"[Pipeline] ⚠️ AgenticScheduler 初始化失败: {e}")
+                print(f"[Pipeline] 回退到线性执行顺序")
+                self.enable_dag_scheduling = False
+        return self._scheduler
 
     @property
     def ref_selection_agent(self):
@@ -337,18 +375,164 @@ class T2VGroundingPipeline:
         if self.is_rank0 and global_caption:
             self.parser.set_global_caption(global_caption)
 
+        # ── DAG 调度：确定最优执行顺序 ──────────────────────────────────────────
+        schedule_result = None
+        execution_order = [s.shot_id for s in shots]  # 默认线性顺序
+
+        if self.is_rank0 and self.enable_dag_scheduling and len(shots) > 1:
+            schedule_result = self._compute_dag_schedule(shots, global_caption)
+            if schedule_result and schedule_result.dag_optimized:
+                execution_order = schedule_result.execution_order
+                print(f"\n[Pipeline] 📊 DAG 调度优化生效:")
+                print(f"           原始顺序: {[s.shot_id for s in shots]}")
+                print(f"           执行顺序: {execution_order}")
+                print(f"           预期质量提升: +{schedule_result.expected_benefit.get('anchor_quality_improvement', 0):.2f}")
+
+        # 广播执行顺序给其他 rank
+        if self.world_size > 1 and dist.is_initialized():
+            order_data = [execution_order]
+            dist.broadcast_object_list(order_data, src=0)
+            execution_order = order_data[0]
+
+        # 建立 shot_id -> ShotConfig 的映射
+        shot_map = {s.shot_id: s for s in shots}
+
+        # ── 按 DAG 优化后的顺序执行 ─────────────────────────────────────────────
         results = []
-        for shot in shots:
+        results_by_id = {}  # 按 shot_id 存储结果，最后按叙事顺序输出
+
+        for exec_idx, shot_id in enumerate(execution_order):
+            shot = shot_map.get(shot_id)
+            if shot is None:
+                print(f"[Pipeline] ⚠️ Shot {shot_id} 不存在，跳过")
+                continue
+
             if self.is_rank0:
                 print(f"\n{'='*60}")
-                print(f"[Pipeline] ── Shot {shot.shot_id} ──")
-            result = self._process_shot(shot)
-            if self.is_rank0:
-                results.append(result)
+                dag_info = ""
+                if schedule_result and schedule_result.dag_optimized:
+                    narrative_pos = [s.shot_id for s in shots].index(shot_id) + 1
+                    dag_info = f" (DAG执行: {exec_idx+1}/{len(execution_order)}, 叙事: {narrative_pos}/{len(shots)})"
+                print(f"[Pipeline] ── Shot {shot.shot_id}{dag_info} ──")
 
+            result = self._process_shot(shot)
+            if self.is_rank0 and result:
+                results_by_id[shot_id] = result
+
+        # ── 按叙事顺序整理结果 ────────────────────────────────────────────────
         if self.is_rank0:
+            for shot in shots:
+                if shot.shot_id in results_by_id:
+                    results.append(results_by_id[shot.shot_id])
+
+            # 保存调度报告
+            if schedule_result:
+                self._save_schedule_report(schedule_result)
+
             self._save_report(results)
+
         return results
+
+    def _compute_dag_schedule(
+        self,
+        shots: List[ShotConfig],
+        global_caption: str = "",
+    ) -> Optional[ScheduleResult]:
+        """
+        计算 DAG 调度顺序
+
+        分析 script，预测每个 shot 的 grounding 质量，
+        构建执行依赖图，返回优化后的执行顺序。
+
+        Returns:
+            ScheduleResult 或 None（调度失败时）
+        """
+        if self.scheduler is None:
+            return None
+
+        print(f"\n[Pipeline] 📊 开始 DAG 调度分析...")
+
+        # Step 1: 预解析所有 shot，获取实体信息
+        # 使用一个临时 parser 来避免影响主 parser 的状态
+        from entity_parser.parser import EntityParser
+        temp_parser = EntityParser(model=self.parser.llm.model)
+        if global_caption:
+            temp_parser.set_global_caption(global_caption)
+
+        shot_infos = []
+        all_entities = {}  # entity_id -> EntityInfo
+
+        for shot in shots:
+            parse_result = temp_parser.parse(shot.text, shot.shot_id)
+
+            # 分析镜头类型
+            shot_text_lower = shot.text.lower()
+            if any(kw in shot_text_lower for kw in ["close-up", "closeup", "close up", "tight shot"]):
+                shot_type = ShotType.CLOSEUP
+            elif any(kw in shot_text_lower for kw in ["wide shot", "wide angle", "full shot"]):
+                shot_type = ShotType.WIDE
+            elif any(kw in shot_text_lower for kw in ["establishing", "exterior of"]):
+                shot_type = ShotType.ESTABLISHING
+            else:
+                shot_type = ShotType.MEDIUM
+
+            entity_ids = []
+            for entity in parse_result.entities:
+                if entity.grounding_priority in ("high", "medium"):
+                    entity_ids.append(entity.entity_id)
+
+                    # 记录实体信息
+                    if entity.entity_id not in all_entities:
+                        all_entities[entity.entity_id] = EntityInfo(
+                            entity_id=entity.entity_id,
+                            entity_type=entity.type,
+                            text_description=entity.text_description,
+                            first_appearance_shot=shot.shot_id,
+                        )
+
+            shot_infos.append(ShotInfo(
+                shot_id=shot.shot_id,
+                text=shot.text,
+                shot_type=shot_type,
+                entities=entity_ids,
+            ))
+
+        entity_list = list(all_entities.values())
+
+        print(f"[Pipeline] 预解析完成: {len(shot_infos)} shots, {len(entity_list)} entities")
+        for si in shot_infos:
+            print(f"           Shot {si.shot_id} [{si.shot_type.value}]: {si.entities}")
+
+        # Step 2: 调用调度器分析
+        try:
+            schedule = self.scheduler.analyze(shot_infos, entity_list)
+            return schedule
+        except Exception as e:
+            print(f"[Pipeline] ⚠️ DAG 调度分析失败: {e}")
+            return None
+
+    def _save_schedule_report(self, schedule: ScheduleResult):
+        """保存调度分析报告"""
+        report_path = os.path.join(self.output_dir, "schedule_report.json")
+
+        report = {
+            "dag_optimized": schedule.dag_optimized,
+            "narrative_order": schedule.narrative_order,
+            "execution_order": schedule.execution_order,
+            "reference_sources": schedule.reference_sources,
+            "expected_benefit": schedule.expected_benefit,
+            "dependencies": [
+                {"from": d[0], "to": d[1], "reason": d[2]}
+                for d in schedule.dependencies
+            ],
+            "quality_matrix": schedule.quality_matrix,
+            "reasoning": schedule.reasoning,
+        }
+
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+
+        print(f"[Pipeline] 调度报告已保存: {report_path}")
 
     def _process_shot(self, shot: ShotConfig) -> Optional[ShotResult]:
         import torch.distributed as dist
@@ -1202,15 +1386,28 @@ class T2VGroundingPipeline:
             for s in good[:self.max_refs_per_entity]:
                 # 获取 id_confidence（仅 character 类型有意义，其他类型默认 1.0）
                 id_conf = s.id_confidence if entity.type == "character" else 1.0
-                entry = ReferenceEntry(
-                    entity_id=entity.entity_id,
-                    shot_id=shot_id,
-                    frame_path="",
-                    crop_path=s.crop_path,
-                    quality_score=float(s.final_score),
-                    source="grounding",
-                    id_confidence=float(id_conf),
-                )
+
+                # 根据 Registry 类型选择正确的 ReferenceEntry 类
+                if self.use_smart_registry:
+                    entry = SmartReferenceEntry(
+                        entity_id=entity.entity_id,
+                        shot_id=shot_id,
+                        frame_path="",
+                        crop_path=s.crop_path,
+                        quality_score=float(s.final_score),
+                        source="grounding",
+                        id_confidence=float(id_conf),
+                    )
+                else:
+                    entry = ReferenceEntry(
+                        entity_id=entity.entity_id,
+                        shot_id=shot_id,
+                        frame_path="",
+                        crop_path=s.crop_path,
+                        quality_score=float(s.final_score),
+                        source="grounding",
+                        id_confidence=float(id_conf),
+                    )
 
                 # SmartRegistry 返回 (success, reason)，旧版 Registry 返回 None
                 result = self.registry.register(entity.entity_id, entry)

@@ -42,6 +42,8 @@ This agentic perspective leads to our core design: \textbf{Grounding-in-the-Loop
 Beyond the grounding loop, our pipeline incorporates multiple \textbf{runtime agentic decisions}:
 
 \begin{itemize}
+    \item \textbf{Quality-Aware Shot Scheduling:} We \emph{perceive} the script structure and predict grounding quality for each shot-entity pair, \emph{reason} about optimal execution order via a dependency DAG, and \emph{act} by generating high-quality close-up shots first to establish strong reference anchors---even when they appear later in narrative order.
+
     \item \textbf{Generation-Verification Loop:} After generating anchor shots, we \emph{perceive} entity counts using a multimodal LLM, \emph{reason} about correctness, and \emph{act} by retrying with adjusted seeds or enhanced prompts if mismatches occur---preventing errors from propagating.
 
     \item \textbf{Subject-Aware Mode Routing:} We \emph{perceive} what references are available, \emph{reason} about whether subject (character/object) anchoring exists, and \emph{act} by routing to T2V or S2V accordingly---avoiding style drift from location-only conditioning.
@@ -65,6 +67,8 @@ A final design choice reinforces our agentic flexibility: we adopt \textbf{subje
 
     \item \textbf{Grounding-in-the-Loop:} A self-bootstrapping paradigm where references are extracted from generated videos via visual grounding, ensuring stylistic consistency through agentic self-perception.
 
+    \item \textbf{Quality-Aware Agentic Shot Scheduling:} We observe that the quality of visual grounding varies dramatically across shots due to camera distance and lighting. We propose an agentic planning approach where an LLM constructs a dependency-aware execution DAG, enabling ``reference bootstrapping''---generating high-quality close-up shots first to establish strong anchors, even when they appear later in narrative order.
+
     \item \textbf{Runtime agentic decisions:} Multiple perception-reasoning-action mechanisms---generation verification, subject-aware routing, lighting analysis, frontal-aware filtering---that actively adapt to generation outcomes.
 
     \item \textbf{Training-free deployment:} Our method requires no training or fine-tuning, enabling immediate deployment on any compatible T2V/S2V backbone.
@@ -79,7 +83,91 @@ Omit for now.
 
 We introduce T2V-Grounding, an agentic pipeline for multi-shot video generation with cross-shot entity consistency. Given a multi-shot script $\mathcal{S} = \{s_1, s_2, \ldots, s_N\}$ where each shot $s_n$ is a natural language description, and an optional global caption $\mathcal{C}_{\text{global}}$ describing the overall narrative context, our goal is to generate a sequence of videos $\mathcal{V} = \{v_1, v_2, \ldots, v_N\}$ such that entities appearing across multiple shots maintain consistent visual identity.
 
-The pipeline consists of six components: (1)~an LLM-based Entity Parser, (2)~a Global Context Extractor, (3)~an Entity Registry, (4)~a Visual Grounding Module, (5)~a Reference Quality Scorer, and (6)~an Adaptive Video Generator. These are orchestrated by an agentic loop that processes shots sequentially. A key design is our \textbf{four-layer prompt construction}, which separates global semantic context, lighting guidance (for close-ups), shot-specific entity descriptions, and action text, preventing entity leakage across shots while maintaining stylistic and lighting coherence.
+The pipeline consists of six components: (1)~an LLM-based Entity Parser, (2)~a Global Context Extractor, (3)~an Entity Registry, (4)~a Visual Grounding Module, (5)~a Reference Quality Scorer, (6)~an Adaptive Video Generator, and (7)~an Agentic Shot Scheduler. These are orchestrated by an agentic loop that can execute shots in an \textbf{optimized order determined by DAG scheduling}. A key design is our \textbf{four-layer prompt construction}, which separates global semantic context, lighting guidance (for close-ups), shot-specific entity descriptions, and action text, preventing entity leakage across shots while maintaining stylistic and lighting coherence.
+
+% ----------------------------------------------------------------------------
+\subsection{Quality-Aware Agentic Shot Scheduling}
+
+A fundamental assumption in existing multi-shot video generation is that shots should be executed in \emph{narrative order}: Shot~1 $\to$ Shot~2 $\to$ $\cdots$ $\to$ Shot~$N$. This implicitly assumes that the first appearance of an entity provides the best reference for subsequent shots. However, we observe that \textbf{grounding quality varies dramatically across shots}:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Shot Type} & \textbf{Entity Coverage} & \textbf{Grounding Quality} \\
+\midrule
+Close-up & 50--80\% & High (0.85--0.95) \\
+Medium shot & 15--40\% & Medium (0.50--0.70) \\
+Wide shot & 3--10\% & Low (0.25--0.40) \\
+Establishing & $<$5\% & Very low (0.15--0.30) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+If Shot~1 is a wide establishing shot and Shot~3 contains a character close-up, executing linearly would establish a \emph{poor-quality} anchor from Shot~1 (low resolution, possible profile view), causing appearance drift in all subsequent shots. Our key insight is:
+
+\vspace{0.3em}
+\noindent\fbox{\parbox{0.95\columnwidth}{
+\textbf{Narrative order $\neq$ optimal generation order.} Shots with high grounding quality should be executed first to establish strong reference anchors, regardless of their position in the script.
+}}
+\vspace{0.3em}
+
+\textbf{DAG-Based Execution Scheduling.} We model the multi-shot generation process as a directed acyclic graph (DAG):
+
+\begin{itemize}
+    \item \textbf{Nodes:} Each shot $s_n \in \mathcal{S}$
+    \item \textbf{Edges:} $s_i \to s_j$ if shot $j$ requires entity references from shot $i$
+\end{itemize}
+
+Rather than assuming $s_1 \to s_2 \to \cdots \to s_N$, we construct the DAG based on \emph{predicted grounding quality}:
+
+\begin{enumerate}
+    \item \textbf{Quality Prediction.} For each (shot, entity) pair, we predict grounding quality $Q(s_n, e)$ based on shot type, lighting conditions, and entity prominence:
+    \begin{equation}
+    Q(s_n, e) = Q_{\text{base}}(\text{shot\_type}) \cdot \alpha_{\text{light}} \cdot \alpha_{\text{occl}} \cdot \alpha_{\text{pose}}
+    \end{equation}
+    where $Q_{\text{base}}$ is determined by shot type (close-up: 0.9, medium: 0.6, wide: 0.35), and $\alpha$ factors account for lighting (0.7 for backlit), occlusion (0.6 for partial), and pose (0.5 for profile/back view).
+
+    \item \textbf{Reference Source Identification.} For each entity $e$, identify the ``reference source'' shot---the shot that will provide the highest quality anchor:
+    \begin{equation}
+    s^*_e = \argmax_{s_n : e \in \mathcal{E}_n} Q(s_n, e)
+    \end{equation}
+
+    \item \textbf{DAG Construction.} Build execution dependencies:
+    \begin{itemize}
+        \item Reference source shots have no incoming edges (execute first)
+        \item Other shots containing entity $e$ depend on $s^*_e$
+    \end{itemize}
+
+    \item \textbf{Topological Execution.} Execute shots in topological order of the DAG. Ties are broken by narrative order to maintain temporal coherence where possible.
+\end{enumerate}
+
+\textbf{Benefit Assessment.} Before applying DAG scheduling, we compute the expected benefit:
+\begin{equation}
+\Delta Q = \max_e Q(s^*_e, e) - Q(s_1, e)
+\end{equation}
+
+If $\Delta Q < \tau_{\text{benefit}}$ (default 0.15), the improvement is negligible and we fall back to linear execution, avoiding unnecessary complexity.
+
+\textbf{Example: Close-up After Wide Shot.} Consider:
+\begin{itemize}
+    \item Shot 1: Wide shot---Sarah walks through marketplace
+    \item Shot 2: Medium shot---Sarah stops at fruit stall
+    \item Shot 3: Close-up---Sarah examines apple
+    \item Shot 4: Wide shot---Sarah continues walking
+\end{itemize}
+
+\emph{Linear execution:} Shot~1 provides Sarah's anchor (quality 0.35, small figure).
+
+\emph{DAG execution:} Shot~3 identified as reference source (quality 0.90, frontal close-up). Execution order: 3 $\to$ 1 $\to$ 2 $\to$ 4. Shot~1's generation now benefits from the high-quality anchor established in Shot~3.
+
+\textbf{Progressive Reveal Handling.} A special case is ``progressive reveal'' scripts where a character is intentionally obscured early:
+\begin{itemize}
+    \item Shot 1: Mysterious hooded figure in shadows
+    \item Shot 2: Figure steps into light, face partially visible
+    \item Shot 3: Figure removes hood, revealing Detective Chen
+\end{itemize}
+
+The scheduler recognizes that Shot~3 is the only viable reference source for ``Chen''. Even though narratively the reveal should be delayed, we generate Shot~3 first to establish Chen's appearance, then use that reference to ensure the ``mysterious figure'' in Shots~1--2 is visually consistent with the revealed identity.
 
 % ----------------------------------------------------------------------------
 \subsection{LLM-Based Entity Parser with Coreference}
