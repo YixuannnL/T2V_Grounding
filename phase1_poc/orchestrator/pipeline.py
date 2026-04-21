@@ -76,6 +76,12 @@ class T2VGroundingPipeline:
     用法:
         pipeline = T2VGroundingPipeline(output_dir="./output")
         results = pipeline.run(shots)
+
+    Agentic 模式（参考图智能选择）:
+        pipeline = T2VGroundingPipeline(
+            output_dir="./output",
+            ref_selection_mode="agent",  # "traditional" | "agent" | "hybrid"
+        )
     """
 
     def __init__(
@@ -107,6 +113,9 @@ class T2VGroundingPipeline:
         enable_shot1_verification: bool = True,
         shot1_max_retries: int = 3,
         shot1_verify_person_count: bool = True,
+        # ── Agentic 参考图选择参数 ──
+        ref_selection_mode: str = "traditional",  # "traditional" | "agent" | "hybrid"
+        ref_selection_model: str = "claude-sonnet-4-6",  # Agent 使用的 VLM 模型
     ):
         import torch
         import torch.distributed as dist
@@ -128,6 +137,11 @@ class T2VGroundingPipeline:
         self.enable_shot1_verification = enable_shot1_verification
         self.shot1_max_retries = shot1_max_retries
         self.shot1_verify_person_count = shot1_verify_person_count
+
+        # Agentic 参考图选择参数
+        self.ref_selection_mode = ref_selection_mode
+        self.ref_selection_model = ref_selection_model
+        self._ref_selection_agent = None  # 延迟初始化
 
         if self.is_rank0:
             for sub in ["frames", "crops", "videos", "registry", "selected_refs", "prompts", "used_refs"]:
@@ -184,6 +198,75 @@ class T2VGroundingPipeline:
         if self.is_rank0:
             print(f"[Pipeline] 初始化完成 | output={output_dir} | "
                   f"mock={self.mock_mode} | world_size={self.world_size}")
+            if self.ref_selection_mode != "traditional":
+                print(f"[Pipeline] 🤖 Agentic 参考图选择已启用 (mode={self.ref_selection_mode}, model={self.ref_selection_model})")
+
+    # ── Agentic 参考图选择 ─────────────────────────────────────────────────────
+
+    @property
+    def ref_selection_agent(self):
+        """获取参考图选择 Agent（延迟初始化）"""
+        if self._ref_selection_agent is None and self.ref_selection_mode != "traditional":
+            try:
+                from agents.reference_selection_agent import ReferenceSelectionAgent
+                self._ref_selection_agent = ReferenceSelectionAgent(
+                    model=self.ref_selection_model,
+                    enable_fallback=(self.ref_selection_mode == "hybrid"),
+                    verbose=True,
+                )
+                print(f"[Pipeline] ReferenceSelectionAgent 初始化成功")
+            except Exception as e:
+                print(f"[Pipeline] ⚠️ ReferenceSelectionAgent 初始化失败: {e}")
+                print(f"[Pipeline] 回退到传统参考图选择模式")
+                self.ref_selection_mode = "traditional"
+        return self._ref_selection_agent
+
+    def _agent_select_reference(
+        self,
+        entity,
+        candidates: List[ReferenceEntry],
+        shot_text: str,
+        shot_type: str,
+    ) -> Optional[ReferenceEntry]:
+        """
+        使用 Agent 从候选参考图中选择最佳参考
+
+        Args:
+            entity: Entity 对象
+            candidates: 候选 ReferenceEntry 列表
+            shot_text: 当前镜头描述
+            shot_type: 镜头类型 (close-up / medium / wide)
+
+        Returns:
+            选中的 ReferenceEntry，或 None
+        """
+        if not candidates:
+            return None
+
+        agent = self.ref_selection_agent
+        if agent is None:
+            # Agent 不可用，回退到传统方法
+            return candidates[0] if candidates else None
+
+        # 调用 Agent 选择
+        crop_paths = [r.crop_path for r in candidates]
+        result = agent.select_best_reference(
+            entity_id=entity.entity_id,
+            entity_type=entity.type,
+            entity_description=entity.text_description,
+            candidates=crop_paths,
+            shot_context=shot_text,
+            shot_type=shot_type,
+        )
+
+        if result.selected_index >= 0 and result.selected_index < len(candidates):
+            selected = candidates[result.selected_index]
+            print(f"[Pipeline] 🤖 Agent 选择 {entity.entity_id}: shot={selected.shot_id}, "
+                  f"confidence={result.confidence:.2f}")
+            print(f"[Pipeline]    理由: {result.reason[:80]}...")
+            return selected
+
+        return candidates[0] if candidates else None
 
     # ── 主入口 ────────────────────────────────────────────────────────────────
 
@@ -326,7 +409,18 @@ class T2VGroundingPipeline:
             # 【v2.3 新增】Frontal-Aware 检查：
             # 如果 character 的锚点参考是背影/侧面（id_confidence < min_face_confidence），
             # 则不使用这个参考图，改为在 prompt 中注入外观描述（Appearance Context）
+            #
+            # 【v3.0 新增】Agentic 参考图选择：
+            # 如果 ref_selection_mode != "traditional"，使用 VLM Agent 智能选择参考图
+            # Agent 会根据当前 shot 的上下文（镜头类型、动作描述）选择最合适的参考图
             faceless_characters = []  # 记录无脸参考的 character，后续构建 Appearance Context
+
+            # 检测镜头类型（用于 Agent 选择）
+            shot_type_for_agent = "medium"
+            if is_closeup:
+                shot_type_for_agent = "close-up"
+            elif is_wide:
+                shot_type_for_agent = "wide"
 
             for entity in sorted_non_loc[:max_non_loc_refs]:
                 # character 使用锚点查询：优先选择高质量正脸
@@ -340,11 +434,32 @@ class T2VGroundingPipeline:
                               f"跳过人脸参考图，将使用 Appearance Context 描述")
                         continue
 
-                    anchor = self.registry.query_anchor(
-                        entity.entity_id,
-                        min_quality=self.min_ref_quality,
-                        high_quality_threshold=self.high_quality_threshold,
-                    )
+                    # 【v3.0】根据 ref_selection_mode 选择参考图
+                    if self.ref_selection_mode != "traditional":
+                        # Agentic 模式：使用 VLM Agent 智能选择
+                        candidates = self.registry.query(
+                            entity.entity_id,
+                            top_k=6,  # 给 Agent 更多候选
+                            min_quality=self.min_ref_quality,
+                            anchor_strategy="earliest_good",
+                        )
+                        if candidates:
+                            anchor = self._agent_select_reference(
+                                entity=entity,
+                                candidates=candidates,
+                                shot_text=shot.text,
+                                shot_type=shot_type_for_agent,
+                            )
+                        else:
+                            anchor = None
+                    else:
+                        # 传统模式：使用固定的锚点策略
+                        anchor = self.registry.query_anchor(
+                            entity.entity_id,
+                            min_quality=self.min_ref_quality,
+                            high_quality_threshold=self.high_quality_threshold,
+                        )
+
                     if anchor:
                         # 【v2.3】检查 id_confidence：如果太低，说明是背影/侧面
                         if anchor.id_confidence < self.min_face_confidence:
@@ -357,35 +472,76 @@ class T2VGroundingPipeline:
                             # 有脸参考：正常使用
                             reference_used[entity.entity_id] = [anchor.crop_path]
                             all_ref_paths.append(anchor.crop_path)
-                            print(f"[Pipeline] {entity.entity_id}: 使用锚点参考图 "
+                            print(f"[Pipeline] {entity.entity_id}: 使用{'Agent选择的' if self.ref_selection_mode != 'traditional' else '锚点'}参考图 "
                                   f"(shot={anchor.shot_id}, score={anchor.quality_score:.2f}, "
                                   f"id_conf={anchor.id_confidence:.2f})")
                 else:
-                    # object 等其他类型用普通查询
-                    refs = self.registry.query(
-                        entity.entity_id, top_k=1,
-                        min_quality=self.min_ref_quality,
-                        anchor_strategy="earliest_good"
-                    )
-                    if refs:
-                        reference_used[entity.entity_id] = [refs[0].crop_path]
-                        all_ref_paths.append(refs[0].crop_path)
+                    # object 等其他类型
+                    # 【v3.0】同样支持 Agentic 选择
+                    if self.ref_selection_mode != "traditional":
+                        # Agentic 模式
+                        candidates = self.registry.query(
+                            entity.entity_id,
+                            top_k=6,
+                            min_quality=self.min_ref_quality,
+                            anchor_strategy="earliest_good",
+                        )
+                        if candidates:
+                            selected = self._agent_select_reference(
+                                entity=entity,
+                                candidates=candidates,
+                                shot_text=shot.text,
+                                shot_type=shot_type_for_agent,
+                            )
+                            if selected:
+                                reference_used[entity.entity_id] = [selected.crop_path]
+                                all_ref_paths.append(selected.crop_path)
+                    else:
+                        # 传统模式
+                        refs = self.registry.query(
+                            entity.entity_id, top_k=1,
+                            min_quality=self.min_ref_quality,
+                            anchor_strategy="earliest_good"
+                        )
+                        if refs:
+                            reference_used[entity.entity_id] = [refs[0].crop_path]
+                            all_ref_paths.append(refs[0].crop_path)
 
             # ── 处理 location 实体（场景一致性 / 光线一致性）────────────────────
             # 根据上面的 Agentic 决策结果决定是否传 location
-            # 使用 query_anchor_location：优先最早 shot，除非后续有明显更好的
+            # 【v3.0】location 也支持 Agent 选择
             if include_location:
                 for loc_entity in location_entities:
-                    anchor = self.registry.query_anchor_location(
-                        loc_entity.entity_id,
-                        min_quality=0.3,
-                        high_quality_threshold=0.7,  # 质量 >= 0.7 的直接用
-                        quality_gap_ratio=1.5,       # 后续需要好 1.5 倍以上才切换
-                    )
+                    if self.ref_selection_mode != "traditional":
+                        # Agentic 模式
+                        candidates = self.registry.query(
+                            loc_entity.entity_id,
+                            top_k=6,
+                            min_quality=0.3,
+                            anchor_strategy="earliest_good",
+                        )
+                        if candidates:
+                            anchor = self._agent_select_reference(
+                                entity=loc_entity,
+                                candidates=candidates,
+                                shot_text=shot.text,
+                                shot_type=shot_type_for_agent,
+                            )
+                        else:
+                            anchor = None
+                    else:
+                        # 传统模式
+                        anchor = self.registry.query_anchor_location(
+                            loc_entity.entity_id,
+                            min_quality=0.3,
+                            high_quality_threshold=0.7,  # 质量 >= 0.7 的直接用
+                            quality_gap_ratio=1.5,       # 后续需要好 1.5 倍以上才切换
+                        )
+
                     if anchor:
                         reference_used[loc_entity.entity_id] = [anchor.crop_path]
                         all_ref_paths.append(anchor.crop_path)
-                        print(f"[Pipeline] Location '{loc_entity.entity_id}' 使用锚点参考图 "
+                        print(f"[Pipeline] Location '{loc_entity.entity_id}' 使用{'Agent选择的' if self.ref_selection_mode != 'traditional' else '锚点'}参考图 "
                               f"(shot={anchor.shot_id}, score={anchor.quality_score:.2f})")
                     else:
                         print(f"[Pipeline] Location '{loc_entity.entity_id}' 无参考图 (新场景，将在生成后 grounding)")

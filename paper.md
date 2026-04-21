@@ -49,6 +49,8 @@ Beyond the grounding loop, our pipeline incorporates multiple \textbf{runtime ag
     \item \textbf{Agentic Lighting Analysis:} For close-up shots, an LLM \emph{perceives} the scene's lighting complexity, \emph{reasons} about whether visual reference or textual description better preserves consistency, and \emph{acts} by including or excluding location references.
 
     \item \textbf{Frontal-Aware Filtering:} We \emph{perceive} face detection confidence in character references, \emph{reason} that back-view references may cause hallucinated faces, and \emph{act} by switching to text-based appearance description when confidence is low.
+
+    \item \textbf{Agentic Reference Selection:} Rather than relying on fixed scoring formulas (e.g., InsightFace for faces), we \emph{perceive} candidate references via a Vision Language Model (VLM), \emph{reason} about which reference best matches the current shot's semantic requirements (dialogue scene $\to$ frontal face, action scene $\to$ dynamic pose), and \emph{act} by selecting the most contextually appropriate reference with explicit justification.
 \end{itemize}
 
 These mechanisms embody genuine agentic behavior---not just modular decomposition with agent-like naming, but active perception of generation outcomes, reasoning about quality and constraints, and adaptive action based on runtime observations.
@@ -390,6 +392,64 @@ This \textbf{frontal-aware} strategy ensures:
     \item S2V mode only receives character references with visible faces, preventing face hallucination.
     \item Faceless characters maintain appearance consistency through detailed text descriptions.
     \item Location references remain usable (no full fallback to T2V), preserving scene consistency.
+\end{enumerate}
+
+% ----------------------------------------------------------------------------
+\subsection{Agentic Reference Selection}
+
+Traditional reference selection relies on fixed scoring formulas: InsightFace for face quality, Laplacian variance for sharpness, and hand-tuned weights. This approach has fundamental limitations:
+
+\begin{itemize}
+    \item \textbf{Domain-specific:} Face scoring only works for characters; objects (vehicles, props) and locations (scenes) have no principled scoring method.
+    \item \textbf{Context-blind:} The same frontal face reference may be ideal for a dialogue scene but suboptimal for an action sequence where a dynamic pose would better match.
+    \item \textbf{Unexplainable:} Numeric scores provide no insight into why a reference was selected.
+\end{itemize}
+
+We introduce an \textbf{Agentic Reference Selection} mechanism that replaces fixed scoring with VLM-based semantic reasoning:
+
+\textbf{Input Construction.} For each entity requiring reference selection, we present the VLM with:
+\begin{itemize}
+    \item Candidate reference images (up to 6) from the registry
+    \item Entity description and type (character/object/location)
+    \item Current shot context (the prompt being generated)
+    \item Shot type (close-up/medium/wide)
+\end{itemize}
+
+\textbf{VLM Analysis.} The VLM analyzes each candidate along entity-type-specific dimensions:
+
+\begin{center}
+\begin{tabular}{lp{5cm}}
+\toprule
+\textbf{Entity Type} & \textbf{Evaluation Criteria} \\
+\midrule
+Character & Angle, expression, pose, lighting, clarity \\
+Object & Angle, completeness, clarity, context \\
+Location & Coverage, lighting mood, composition, atmosphere \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Structured Output.} The VLM returns:
+\begin{equation}
+(\text{idx}, \text{conf}, \text{reason}, \text{alts}) = \text{VLM}(\mathcal{I}_{\text{cand}}, e, s_n, \text{type})
+\end{equation}
+where $\text{idx}$ is the selected candidate index, $\text{conf} \in [0,1]$ is selection confidence, $\text{reason}$ is natural language justification, and $\text{alts}$ are ranked alternatives.
+
+\textbf{Hybrid Mode with Fallback.} To ensure robustness, we support three selection modes:
+\begin{itemize}
+    \item \texttt{agent}: Pure VLM selection (fails if VLM unavailable)
+    \item \texttt{traditional}: Fixed scoring formulas (legacy behavior)
+    \item \texttt{hybrid} (default): VLM-first with automatic fallback to traditional scoring on VLM failure
+\end{itemize}
+
+The hybrid mode provides the best of both worlds: intelligent, context-aware selection when VLM is available, with guaranteed fallback for reliability.
+
+\textbf{Benefits.} Agentic reference selection provides:
+\begin{enumerate}
+    \item \textbf{Universality:} Same mechanism handles characters, objects, and locations---no entity-specific scoring functions needed.
+    \item \textbf{Context awareness:} Selections adapt to shot semantics (dialogue $\to$ frontal, action $\to$ dynamic).
+    \item \textbf{Explainability:} Each selection includes natural language justification for debugging and human review.
+    \item \textbf{Graceful degradation:} Hybrid mode ensures reliability even when VLM is unavailable.
 \end{enumerate}
 
 % ----------------------------------------------------------------------------

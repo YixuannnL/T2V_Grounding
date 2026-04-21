@@ -948,6 +948,10 @@ T2V_Grounding/
 │   ├── run_demo.py                  # 主入口（单卡/多卡通用）
 │   ├── scripts/
 │   │   └── setup_referdino.sh       # 【v3.0】ReferDINO 一键安装脚本
+│   ├── agents/                       # 【v3.0 新增】Agentic 模块
+│   │   ├── __init__.py
+│   │   ├── reference_selection_agent.py   # VLM 智能参考图选择
+│   │   └── reference_selection_strategy.py # 策略封装（traditional/agent/hybrid）
 │   ├── entity_parser/
 │   │   └── parser.py                # LLM 实体提取 + 共指消解 + 全局语义提取 + 实体数量提取 + 光线分析
 │   ├── visual_grounding/
@@ -1204,3 +1208,95 @@ A：确认多卡配置正确：
 | `test_dual_character.yaml` | 5 | 无 | 双角色互不干扰 |
 | `test_office_conversation.yaml` | 6 | **有** | 双角色对话、close-up/wide 切换、**Agentic 光线决策测试** |
 | `test_scene_consistency.yaml` | 4 | 无 | 场景一致性 |
+
+---
+
+## Agentic 参考图选择（v3.0 新增）
+
+### 动机
+
+传统的参考图选择依赖 InsightFace 人脸打分，但存在明显局限：
+- **只支持人脸**：无法评估 object（车辆、道具）和 location（场景）的参考图质量
+- **不感知上下文**：不知道当前镜头需要什么样的参考图（对话戏需要正面，动作戏需要动态姿态）
+- **不可解释**：只输出分数，无法理解选择理由
+
+### Agentic 方案
+
+我们引入 **ReferenceSelectionAgent**，使用 VLM（Vision Language Model）智能选择参考图：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│             Agentic Reference Selection (v3.0)                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  输入：                                                          │
+│    - 候选参考图（来自 Registry）                                  │
+│    - 当前 shot 描述                                              │
+│    - 实体信息（类型、描述、属性）                                  │
+│                                                                 │
+│  VLM Agent 分析：                                                │
+│    1. 理解镜头需求（close-up 对话？动作追逐？）                    │
+│    2. 评估每张候选图的适配度                                      │
+│    3. 输出选择 + 置信度 + 理由                                    │
+│                                                                 │
+│  优势：                                                          │
+│    ✓ 通用性：人物、物体、场景都能评估                             │
+│    ✓ 上下文感知：根据镜头需求动态选择                             │
+│    ✓ 可解释性：输出选择理由                                       │
+│    ✓ 灵活回退：VLM 失败时自动 fallback 到传统方法                  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 使用方式
+
+**默认已启用 hybrid 模式**（Agent 优先 + 传统 fallback）：
+
+```bash
+# 默认行为（Agentic 选择）
+bash scripts/run_multi_seed.sh 3
+
+# 显式指定模式
+bash scripts/run_multi_seed.sh 3 ./output script.yaml hybrid   # Agent + fallback（推荐）
+bash scripts/run_multi_seed.sh 3 ./output script.yaml agent    # 纯 Agent
+bash scripts/run_multi_seed.sh 3 ./output script.yaml traditional  # 回退传统方式
+
+# 单次运行
+python run_demo.py --script ../configs/test.yaml --ref-selection-mode hybrid
+```
+
+### 配置
+
+在 `config.yaml` 中配置：
+
+```yaml
+agentic:
+  # 参考图选择模式
+  #   - "hybrid": Agent 优先 + 传统 fallback（默认，推荐）
+  #   - "agent": 纯 VLM Agent
+  #   - "traditional": 传统 InsightFace 打分
+  ref_selection_mode: "hybrid"
+
+  # Agent 使用的 VLM 模型
+  ref_selection_model: "claude-sonnet-4-6"
+```
+
+### 选择示例输出
+
+```
+[Pipeline] 🤖 Agentic 参考图选择已启用 (mode=hybrid, model=claude-sonnet-4-6)
+[Pipeline] 🤖 Agent 选择 char_alex: shot=2, confidence=0.92
+[Pipeline]    理由: Selected frontal smiling shot - best matches dialogue scene requirement.
+               Candidate 1 (shot=1) is a profile view, less suitable for close-up dialogue.
+```
+
+### 对比
+
+| 场景 | 传统方式 | Agent 方式 |
+|------|----------|------------|
+| **人物 close-up 对话** | 人脸打分最高 | 选正面、表情自然的 |
+| **人物动作追逐** | 人脸打分最高 | 选动态姿态、侧面也可 |
+| **车辆参考** | 无专用评分（选最早的） | 根据镜头需求选角度 |
+| **场景参考** | 清晰度评分 | 理解光线、构图匹配度 |
+
+---

@@ -78,6 +78,30 @@ agent:
   consistency_threshold: 0.70
   model: "claude-sonnet-4-6-Anthropic"
 
+# ── Agentic 参考图选择（v3.0 新增）─────────────────────────────────────────────
+# 使用 VLM Agent 智能选择参考图，替代传统的 InsightFace 打分
+#
+# 优势：
+#   1. 通用性：人物、物体、场景都能语义评估（不仅限于人脸）
+#   2. 上下文感知：根据镜头类型选择（动作戏选动态姿态，对话选正面）
+#   3. 可解释性：Agent 输出选择理由
+#
+# 用法：
+#   - 命令行: --ref-selection-mode traditional  (如需回退到传统方式)
+#   - 脚本: bash run_multi_seed.sh 3 ./output script.yaml traditional
+agentic:
+  # ref_selection_mode: 参考图选择模式
+  #   - "hybrid": Agent 优先，VLM 失败时自动 fallback 到传统方式（默认，推荐）
+  #   - "agent": 纯 VLM Agent 智能选择（VLM 失败则报错）
+  #   - "traditional": 传统方式（InsightFace 打分 + 固定权重公式，旧版行为）
+  ref_selection_mode: "hybrid"   # 默认启用 Agent 选择
+
+  # ref_selection_model: Agent 使用的 VLM 模型
+  #   - claude-sonnet-4-6: 推荐，均衡性能和成本
+  #   - claude-haiku-4-5: 更快更便宜，但选择质量略低
+  #   - claude-opus-4-6: 最强，但成本高、速度慢
+  ref_selection_model: "claude-sonnet-4-6"
+
 # ── 评测配置 ──────────────────────────────────────────────────────────────────
 evaluation:
   clip_model: "ViT-B/32"

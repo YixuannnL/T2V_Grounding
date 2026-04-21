@@ -86,6 +86,12 @@ def main():
                         help="LLM 模型（默认读 config.yaml）")
     parser.add_argument("--seed", type=int, default=None,
                         help="随机 seed（覆盖 config.yaml 中的 seed；-1=随机）")
+    # ── Agentic 参考图选择 ──
+    parser.add_argument("--ref-selection-mode", type=str, default=None,
+                        choices=["traditional", "agent", "hybrid"],
+                        help="参考图选择模式: traditional(传统InsightFace打分), agent(VLM智能选择), hybrid(Agent优先+fallback)")
+    parser.add_argument("--ref-selection-model", type=str, default=None,
+                        help="Agent 使用的 VLM 模型（默认: claude-sonnet-4-6）")
     args = parser.parse_args()
 
     if args.mock:
@@ -113,10 +119,13 @@ def main():
         print(f"[Demo] 使用内置 demo 脚本（{len(shots)} 个镜头）")
 
     print(f"[Demo] 后端: {args.backend}  |  输出目录: {args.output}")
+    if args.ref_selection_mode and args.ref_selection_mode != "traditional":
+        print(f"[Demo] 🤖 Agentic 参考图选择: mode={args.ref_selection_mode}")
     print("=" * 60)
 
     # 运行 pipeline
     _gcfg = cfg.get("generator", {})
+    _agcfg = cfg.get("agentic", {})  # Agentic 配置
     pipeline = T2VGroundingPipeline(
         output_dir=args.output,
         device=args.device,
@@ -137,6 +146,16 @@ def main():
         guide_scale_img=_gcfg.get("guide_scale_img", 5.0),
         # 命令行 --seed 优先，其次 config.yaml，默认 -1（随机）
         seed=args.seed if args.seed is not None else _gcfg.get("seed", -1),
+        # ── Agentic 参考图选择参数 ──
+        # 优先级: 命令行 > config.yaml > 默认值(traditional)
+        ref_selection_mode=(
+            args.ref_selection_mode
+            or _agcfg.get("ref_selection_mode", "traditional")
+        ),
+        ref_selection_model=(
+            args.ref_selection_model
+            or _agcfg.get("ref_selection_model", "claude-sonnet-4-6")
+        ),
     )
     results = pipeline.run(shots, global_caption=global_caption)
 

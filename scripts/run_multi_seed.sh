@@ -1,15 +1,17 @@
 #!/bin/bash
 # 多 seed 批量生成脚本
-# 用法: bash run_multi_seed.sh [run次数] [输出根目录] [script yaml]
+# 用法: bash run_multi_seed.sh [run次数] [输出根目录] [script yaml] [ref_selection_mode]
 #   例: bash run_multi_seed.sh 3
 #       bash run_multi_seed.sh 5 /tmp/my_outputs
 #       bash run_multi_seed.sh 3 ./out_aba test_aba_scene.yaml
+#       bash run_multi_seed.sh 3 ./out_agent test.yaml agent  # 启用 Agent 参考图选择
 
 set -e
 
 RUNS=${1:-3}
 BASE_OUTPUT=${2:-"/root/paddlejob/workspace/env_run/output/lyx/T2V_Grounding/phase1_poc/output_multi_seed"}
 SCRIPT_NAME=${3:-"test_night_rider.yaml"}
+REF_SELECTION_MODE=${4:-"hybrid"}  # 默认启用 Agent: "hybrid" | "agent" | "traditional"
 
 SCRIPT="/root/paddlejob/workspace/env_run/output/lyx/T2V_Grounding/configs/${SCRIPT_NAME}"
 CONFIG="/root/paddlejob/workspace/env_run/output/lyx/T2V_Grounding/configs/config.yaml"
@@ -23,6 +25,10 @@ echo "  runs      : $RUNS"
 echo "  script    : $SCRIPT"
 echo "  base_output: $BASE_OUTPUT"
 echo "  nproc_per_node: $NGPU"
+echo "  ref_selection_mode: $REF_SELECTION_MODE"
+if [ "$REF_SELECTION_MODE" != "traditional" ]; then
+    echo "  🤖 Agentic 参考图选择已启用"
+fi
 echo "=========================================="
 
 # 预定义 seed 列表（可重复使用、结果可复现）
@@ -50,7 +56,8 @@ for i in $(seq 1 "$RUNS"); do
         --config  "$CONFIG" \
         --output  "$RUN_DIR" \
         --backend phantom \
-        --seed    "$SEED"
+        --seed    "$SEED" \
+        --ref-selection-mode "$REF_SELECTION_MODE"
 
     echo "  [OK] Run $i 完成 -> $RUN_DIR"
 done
