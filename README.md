@@ -174,9 +174,56 @@ Pipeline 在正式处理镜头前，会：
 
 观察发现：当只有 location 参考图而没有 subject（character/object）参考图时，S2V 模型缺少人物外观锚定，会导致生成的人物风格漂移（例如真人变成动画风格）。
 
+**【v3.1 修复】Character-Aware 路由**：
+
+进一步观察发现：当场景中有 character 实体但只有 object 参考图（如马）时，S2V 模式仍然会导致人物动画化。原因是 object 参考图不能锚定人物外观，Phantom 模型会"脑补"一个风格不一致的人物。
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│             Character-Aware Mode Routing (v3.1)                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  场景分析：                                                       │
+│    - 场景是否有 character 实体？                                  │
+│    - 是否有 frontal character 参考图？                            │
+│    - 是否有 object 参考图？                                       │
+│                                                                 │
+│  路由决策：                                                       │
+│                                                                 │
+│  1. 有 frontal character 参考 ──► S2V (phantom)                  │
+│     人物外观有锚定，安全                                          │
+│                                                                 │
+│  2. 场景有 character，但无 frontal 参考 ──► T2V ⚠️                │
+│     即使有 object 参考（马、车等）也不能锚定人物                    │
+│     必须回退 T2V，避免人物动画化                                   │
+│                                                                 │
+│  3. 场景无 character，有 object 参考 ──► S2V (phantom)            │
+│     无人物风格问题                                                │
+│                                                                 │
+│  4. 无任何 subject 参考 ──► T2V                                   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**修复前 vs 修复后**：
+```
+场景：夜骑（人物背影 + 马）
+  - Shot 1: T2V 生成（真实风格）
+  - Shot 2 路由:
+    ├── 有 obj_horse 参考图（马）
+    ├── char_001 是背影，id_confidence=0.0，被标记 faceless
+    │
+    ├── 【旧逻辑】有 object 参考 → S2V → 人物动画化 ❌
+    │
+    └── 【v3.1】场景有 character 但无 frontal 参考 → T2V ✅
+        通过 Appearance Context 描述人物外观，保持真实风格
+```
+
 **解决方案**：基于是否有 subject 参考图来决定生成模式：
-- 有 character/object ref → S2V，外观有锚定
-- 仅有 location ref → T2V + Environment Context prompt，避免风格漂移
+- 有 frontal character ref → S2V，外观有锚定
+- 场景有 character 但无 frontal ref → T2V（即使有 object ref）
+- 场景无 character，有 object ref → S2V
+- 只有 location ref → T2V + Environment Context
 
 **Environment Context 注入**：当回退 T2V 时，从 location 实体中提取环境属性注入 prompt：
 ```

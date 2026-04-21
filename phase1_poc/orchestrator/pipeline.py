@@ -556,38 +556,75 @@ class T2VGroundingPipeline:
             #   - character: 必须有脸（不在 faceless_characters 中）
             #   - object: 正常计入
             #   - 无脸 character 不计入有效 subject ref
-            has_subject_ref = any(
+            #
+            # 【v3.1 修复】Character-Aware 路由：
+            #   问题：当场景中有 character 实体但只有 object 参考图时，
+            #         S2V 模式会导致人物风格漂移（如动画化）
+            #   原因：object 参考图（如马）不能锚定人物外观，Phantom 会"脑补"人物
+            #   修复：如果场景有 character 实体但无 frontal character 参考，
+            #         即使有 object 参考也应该回退 T2V
+            #
+            # 分类统计
+            character_entities_in_shot = [e for e in non_location_entities if e.type == "character"]
+            object_entities_in_shot = [e for e in non_location_entities if e.type == "object"]
+
+            # 有效的 character 参考（frontal，不在 faceless 中）
+            has_frontal_character_ref = any(
                 e.entity_id in reference_used
-                for e in non_location_entities
-                if e not in faceless_characters  # 排除无脸 character
+                for e in character_entities_in_shot
+                if e not in faceless_characters
             )
-            num_subject_refs = len([
-                e for e in non_location_entities
+            # 有效的 object 参考
+            has_object_ref = any(
+                e.entity_id in reference_used
+                for e in object_entities_in_shot
+            )
+
+            num_character_refs = len([
+                e for e in character_entities_in_shot
                 if e.entity_id in reference_used and e not in faceless_characters
+            ])
+            num_object_refs = len([
+                e for e in object_entities_in_shot
+                if e.entity_id in reference_used
             ])
             num_location_refs = len([e for e in location_entities if e.entity_id in reference_used])
 
+            # 【v3.1】Character-Aware 路由决策
+            # 核心原则：如果场景有 character，必须有 frontal character 参考才能用 S2V
             if self.mock_mode:
                 generation_mode = "mock"
-            elif has_subject_ref:
-                # 有 subject ref → S2V，外观有锚定
+            elif has_frontal_character_ref:
+                # 有 frontal character 参考 → S2V 安全，人物外观有锚定
+                generation_mode = "phantom"
+            elif character_entities_in_shot and not has_frontal_character_ref:
+                # 【v3.1 关键修复】场景有 character 但无 frontal 参考
+                # 即使有 object 参考（如马），也不能锚定人物外观
+                # 必须回退 T2V，否则会导致动画化
+                generation_mode = "t2v"
+                reason_parts = []
+                if faceless_characters:
+                    reason_parts.append(f"{len(faceless_characters)} 个无脸 character")
+                else:
+                    reason_parts.append("character 无参考图")
+                if has_object_ref:
+                    reason_parts.append(f"有 {num_object_refs} 个 object 参考但不能锚定人物")
+                print(f"[Pipeline] ⚠️  {', '.join(reason_parts)}，回退 T2V 避免人物风格漂移")
+                # 清空 all_ref_paths，T2V 不传参考图
+                all_ref_paths = []
+            elif has_object_ref:
+                # 场景无 character 实体，但有 object 参考 → S2V 可以
                 generation_mode = "phantom"
             else:
-                # 无 subject ref（可能只有 location ref 或只有无脸 character）→ T2V + prompt 强化
+                # 无任何 subject 参考 → T2V
                 generation_mode = "t2v"
-                if num_location_refs > 0 or faceless_characters:
-                    reason_parts = []
-                    if not has_subject_ref:
-                        reason_parts.append("无有效 subject 参考图")
-                    if faceless_characters:
-                        reason_parts.append(f"{len(faceless_characters)} 个无脸 character")
-                    print(f"[Pipeline] ⚠️  {', '.join(reason_parts)}，回退 T2V 避免风格漂移")
-                    # 清空 all_ref_paths，T2V 不传参考图
+                if num_location_refs > 0:
+                    print(f"[Pipeline] ⚠️  只有 location 参考，回退 T2V")
                     all_ref_paths = []
 
             print(f"[Pipeline] 模式: {generation_mode} | 参考图: {len(all_ref_paths)} 张 "
-                  f"(有效 subject: {num_subject_refs}, location: {num_location_refs}, "
-                  f"无脸 character: {len(faceless_characters)})")
+                  f"(frontal character: {num_character_refs}, object: {num_object_refs}, "
+                  f"location: {num_location_refs}, 无脸 character: {len(faceless_characters)})")
 
             # ── 构建生成 prompt ────────────────────────────────────────────────
             # Prompt 分层：
