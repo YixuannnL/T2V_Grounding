@@ -224,7 +224,7 @@ class VideoQualityCritic:
 
     def __init__(
         self,
-        model: str = "claude-sonnet-4-6-Anthropic",
+        model: str = "claude-sonnet-4-6",
         pass_threshold: float = 0.7,
         sample_frames: int = 5,          # 采样帧数
         max_image_size: int = 512,       # 图片最大边长（节省 token）

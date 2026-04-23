@@ -29,6 +29,8 @@ import os
 import sys
 import json
 import shutil
+import gc
+import torch
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 from PIL import Image
@@ -62,6 +64,24 @@ from verification.video_critic import (
     CritiqueResult,
     RepairStrategyGenerator,
     IssueSeverity,
+)
+# ── 根因分析 & 智能重试 ──
+from retry.root_cause_analyzer import (
+    RootCauseAnalyzer,
+    IssueCategory,
+    DiagnosisResult,
+)
+from retry.smart_retry import (
+    SmartRetryExecutor,
+    RetryStrategy,
+)
+# ── 经验记忆系统 ──
+from experience.advisor import (
+    ExperienceAdvisor,
+    ExperienceAdvice,
+)
+from experience.database import (
+    SceneFingerprint,
 )
 
 
@@ -137,14 +157,19 @@ class T2VGroundingPipeline:
         registry_max_refs_per_shot: int = 2,      # 每 shot 每实体最多注册几张
         # ── Agentic Scheduling 参数 ──
         enable_dag_scheduling: bool = True,       # 是否启用 DAG 调度优化（推荐开启）
-        dag_scheduling_model: str = "claude-sonnet-4-6-Anthropic",  # DAG 调度使用的 LLM
+        dag_scheduling_model: str = "claude-sonnet-4-6",  # DAG 调度使用的 LLM
         dag_min_benefit_threshold: float = 0.15,  # DAG 优化最小收益阈值
         # ── Self-Critique 参数 ──
         enable_self_critique: bool = True,        # 是否启用 Self-Critique（默认开启）
-        critique_model: str = "claude-sonnet-4-6-Anthropic",  # Critique 使用的 VLM
+        critique_model: str = "claude-sonnet-4-6",  # Critique 使用的 VLM
         critique_pass_threshold: float = 0.7,     # Critique 通过阈值
         critique_max_retries: int = 2,            # Critique 失败后最大重试次数
         critique_sample_frames: int = 5,          # Critique 采样帧数
+        # ── 根因分析 & 智能重试参数 ──
+        enable_smart_retry: bool = True,          # 是否启用根因分析式重试（默认开启）
+        # ── 经验记忆系统参数 ──
+        enable_experience_memory: bool = True,    # 是否启用经验记忆（默认开启）
+        experience_db_path: str = "",             # 经验数据库路径（空则使用 output_dir/experience.db）
     ):
         import torch
         import torch.distributed as dist
@@ -191,6 +216,16 @@ class T2VGroundingPipeline:
         self.critique_max_retries = critique_max_retries
         self.critique_sample_frames = critique_sample_frames
         self._video_critic = None  # 延迟初始化
+
+        # ── 根因分析 & 智能重试参数 ──
+        self.enable_smart_retry = enable_smart_retry
+        self._root_cause_analyzer = None  # 延迟初始化
+        self._smart_retry_executor = None  # 延迟初始化
+
+        # ── 经验记忆系统参数 ──
+        self.enable_experience_memory = enable_experience_memory
+        self.experience_db_path = experience_db_path or os.path.join(output_dir, "experience.db")
+        self._experience_advisor = None  # 延迟初始化
 
         if self.is_rank0:
             for sub in ["frames", "crops", "videos", "registry", "selected_refs", "prompts", "used_refs"]:
@@ -278,6 +313,10 @@ class T2VGroundingPipeline:
                 print(f"[Pipeline] 📊 DAG 调度优化已启用 (model={self.dag_scheduling_model})")
             if self.enable_self_critique:
                 print(f"[Pipeline] 🔍 Self-Critique 已启用 (model={self.critique_model}, threshold={self.critique_pass_threshold})")
+            if self.enable_smart_retry:
+                print(f"[Pipeline] 🎯 根因分析式重试已启用 (max_retries={self.critique_max_retries})")
+            if self.enable_experience_memory:
+                print(f"[Pipeline] 📚 经验记忆系统已启用 (db={self.experience_db_path})")
 
     # ── CLIP 模型加载（用于 SmartRegistry 相似度去重）───────────────────────────
 
@@ -301,6 +340,38 @@ class T2VGroundingPipeline:
         except Exception as e:
             print(f"[Pipeline] ⚠️ CLIP 加载失败: {e}，参考图去重功能禁用")
             return None
+
+    # ── VRAM 管理 ─────────────────────────────────────────────────────────────
+
+    def _cleanup_vram_before_retry(self):
+        """
+        在重试生成前清理 VRAM，防止 OOM
+
+        问题背景：
+          - Critique 重试时，上一次 generate() 的中间张量可能仍在 GPU 内存
+          - PyTorch 的缓存分配器会保留已分配的内存块
+          - 多次重试后累积的碎片可能导致 OOM
+
+        解决方案：
+          1. 强制 Python GC 回收不再引用的对象
+          2. 清空 PyTorch CUDA 缓存
+          3. 同步 CUDA 流，确保所有操作完成
+          4. 打印当前 VRAM 使用量（便于调试）
+        """
+        # Step 1: Python GC
+        gc.collect()
+
+        # Step 2: PyTorch CUDA 缓存清理
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+            # Step 3: 同步所有 CUDA 流
+            torch.cuda.synchronize()
+
+            # Step 4: 打印 VRAM 状态
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            print(f"[Pipeline] VRAM 清理完成: allocated={allocated:.2f}GB, reserved={reserved:.2f}GB")
 
     # ── Agentic 参考图选择 ─────────────────────────────────────────────────────
 
@@ -357,6 +428,50 @@ class T2VGroundingPipeline:
                 print(f"[Pipeline] Self-Critique 功能已禁用")
                 self.enable_self_critique = False
         return self._video_critic
+
+    @property
+    def root_cause_analyzer(self):
+        """获取根因分析器（延迟初始化）"""
+        if self._root_cause_analyzer is None and self.enable_smart_retry:
+            try:
+                self._root_cause_analyzer = RootCauseAnalyzer(verbose=True)
+                print(f"[Pipeline] RootCauseAnalyzer 初始化成功")
+            except Exception as e:
+                print(f"[Pipeline] ⚠️ RootCauseAnalyzer 初始化失败: {e}")
+                self.enable_smart_retry = False
+        return self._root_cause_analyzer
+
+    @property
+    def smart_retry_executor(self):
+        """获取智能重试执行器（延迟初始化）"""
+        if self._smart_retry_executor is None and self.enable_smart_retry:
+            try:
+                self._smart_retry_executor = SmartRetryExecutor(
+                    max_retries=self.critique_max_retries,
+                    base_seed=self.base_seed,
+                    verbose=True,
+                )
+                print(f"[Pipeline] SmartRetryExecutor 初始化成功")
+            except Exception as e:
+                print(f"[Pipeline] ⚠️ SmartRetryExecutor 初始化失败: {e}")
+                self.enable_smart_retry = False
+        return self._smart_retry_executor
+
+    @property
+    def experience_advisor(self):
+        """获取经验顾问（延迟初始化）"""
+        if self._experience_advisor is None and self.enable_experience_memory:
+            try:
+                self._experience_advisor = ExperienceAdvisor(
+                    db_path=self.experience_db_path,
+                    min_experiences_for_advice=3,
+                    verbose=True,
+                )
+                print(f"[Pipeline] ExperienceAdvisor 初始化成功")
+            except Exception as e:
+                print(f"[Pipeline] ⚠️ ExperienceAdvisor 初始化失败: {e}")
+                self.enable_experience_memory = False
+        return self._experience_advisor
 
     def _agent_select_reference(
         self,
@@ -470,6 +585,20 @@ class T2VGroundingPipeline:
                 self._save_schedule_report(schedule_result)
 
             self._save_report(results)
+
+            # ── 打印经验系统总结 ──────────────────────────────────────────────
+            if self.enable_experience_memory and self._experience_advisor:
+                try:
+                    summary = self._experience_advisor.get_session_summary()
+                    if summary["total"] > 0:
+                        print(f"\n[Pipeline] 📚 本次 Session 经验总结:")
+                        print(f"           生成次数: {summary['total']}")
+                        print(f"           成功率: {summary['success_rate']:.1%}")
+                        print(f"           平均尝试: {summary['avg_attempts']:.1f}")
+                        if summary.get("common_issues"):
+                            print(f"           常见问题: {summary['common_issues']}")
+                except Exception as e:
+                    print(f"[Pipeline] ⚠️ 获取经验总结失败: {e}")
 
         return results
 
@@ -1055,15 +1184,68 @@ class T2VGroundingPipeline:
             # 广播给其他 rank
             broadcast_data = [
                 gen_prompt, all_ref_paths, generation_mode,
-                needs_verification, person_count_expectation, parse_result
+                needs_verification, person_count_expectation, parse_result,
+                reference_used  # 添加 reference_used 到广播数据
             ]
         else:
-            broadcast_data = [None, None, None, False, None, None]
+            broadcast_data = [None, None, None, False, None, None, {}]
 
         if self.world_size > 1 and dist.is_initialized():
             dist.broadcast_object_list(broadcast_data, src=0)
 
-        prompt, all_ref_paths, generation_mode, needs_verification, person_count_expectation, parse_result = broadcast_data
+        prompt, all_ref_paths, generation_mode, needs_verification, person_count_expectation, parse_result, reference_used = broadcast_data
+
+        # ── Step 2.5: 获取经验建议（生成前）─────────────────────────────────────
+        experience_advice = None
+        if self.is_rank0 and self.enable_experience_memory and self.experience_advisor and generation_mode == "phantom":
+            try:
+                # 检测镜头类型
+                shot_text_lower = shot.text.lower()
+                if any(kw in shot_text_lower for kw in ["close-up", "closeup", "close up"]):
+                    shot_type = "closeup"
+                elif any(kw in shot_text_lower for kw in ["wide shot", "wide angle", "full shot"]):
+                    shot_type = "wide"
+                else:
+                    shot_type = "medium"
+
+                # 创建场景指纹
+                expected_entities = [
+                    {"entity_id": e.entity_id, "type": e.type}
+                    for e in parse_result.entities
+                    if e.grounding_priority in ("high", "medium")
+                ]
+
+                fingerprint = self.experience_advisor.create_fingerprint(
+                    entities=expected_entities,
+                    shot_text=shot.text,
+                    shot_type=shot_type,
+                )
+
+                # 获取建议
+                experience_advice = self.experience_advisor.get_advice(fingerprint)
+
+                if experience_advice and experience_advice.has_suggestions():
+                    # 应用建议的参数
+                    if experience_advice.suggested_ip_adapter_scale:
+                        old_scale = self.generator.config.guide_scale_img
+                        self.generator.config.guide_scale_img = experience_advice.suggested_ip_adapter_scale
+                        print(f"[Pipeline] 📚 经验建议: ip_adapter_scale {old_scale:.2f} → {experience_advice.suggested_ip_adapter_scale:.2f}")
+
+                    if experience_advice.suggested_steps:
+                        old_steps = self.generator.config.num_inference_steps
+                        if experience_advice.suggested_steps != old_steps:
+                            self.generator.config.num_inference_steps = experience_advice.suggested_steps
+                            print(f"[Pipeline] 📚 经验建议: steps {old_steps} → {experience_advice.suggested_steps}")
+
+                    # 打印建议的策略
+                    if experience_advice.recommended_strategies:
+                        print(f"[Pipeline] 📚 如遇问题，推荐策略: {experience_advice.recommended_strategies}")
+
+                    # 打印预期
+                    print(f"[Pipeline] 📚 预期: {experience_advice.expected_attempts:.1f} 次尝试, "
+                          f"{experience_advice.expected_success_rate:.0%} 成功率")
+            except Exception as e:
+                print(f"[Pipeline] ⚠️ 获取经验建议失败: {e}")
 
         # ── Step 3: 生成视频（可能包含验证循环）───────────────────────────────
         all_ref_images: List[Image.Image] = []
@@ -1101,22 +1283,23 @@ class T2VGroundingPipeline:
             verification_metadata = {"verified": False}
 
         # ── Step 3.5: Self-Critique 循环（生成后、grounding 前）─────────────────
+        # 【重要】所有 rank 都必须参与 Critique 循环，因为重试时需要分布式推理
+        # VLM 分析只在 rank 0 上做，结果通过 broadcast 同步给其他 rank
         critique_metadata = {"critique_enabled": False}
-        if self.is_rank0 and self.enable_self_critique and not self.mock_mode:
-            # 只有使用了参考图时才进行 Critique（T2V 无参考图，没有对比基准）
-            if all_ref_paths and generation_mode == "phantom":
-                video_path, critique_metadata = self._generate_with_critique(
-                    shot=shot,
-                    prompt=prompt,
-                    all_ref_images=all_ref_images,
-                    all_ref_paths=all_ref_paths,
-                    video_path=video_path,
-                    parse_result=parse_result,
-                    reference_used=reference_used,
-                )
-            else:
-                if self.is_rank0:
-                    print(f"[Pipeline] Self-Critique 跳过: {'无参考图' if not all_ref_paths else 'T2V模式'}")
+        should_critique = self.enable_self_critique and not self.mock_mode and all_ref_paths and generation_mode == "phantom"
+
+        if should_critique:
+            video_path, critique_metadata = self._generate_with_critique_distributed(
+                shot=shot,
+                prompt=prompt,
+                all_ref_images=all_ref_images,
+                all_ref_paths=all_ref_paths,
+                video_path=video_path,
+                parse_result=parse_result,
+                reference_used=reference_used,
+            )
+        elif self.is_rank0 and self.enable_self_critique and not self.mock_mode:
+            print(f"[Pipeline] Self-Critique 跳过: {'无参考图' if not all_ref_paths else 'T2V模式'}")
 
         # ── Step 4: rank 0 做 grounding → 入库 ───────────────────────────────
         if not self.is_rank0:
@@ -1192,6 +1375,10 @@ class T2VGroundingPipeline:
                 attempt_str = f"[Verify] 尝试 {attempt + 1}/{max_retries + 1}"
                 print(f"{attempt_str}: seed={shot_seed}")
 
+            # 【关键修复】重试前清理 VRAM（attempt > 0 时）
+            if attempt > 0:
+                self._cleanup_vram_before_retry()
+
             # 生成
             self.generator.generate(
                 text_prompt=current_prompt,
@@ -1266,7 +1453,512 @@ class T2VGroundingPipeline:
 
         return video_path, metadata
 
-    # ── Self-Critique 循环 ────────────────────────────────────────────────────
+    # ── Self-Critique 循环（分布式版本）─────────────────────────────────────────
+
+    def _generate_with_critique_distributed(
+        self,
+        shot: ShotConfig,
+        prompt: str,
+        all_ref_images: List[Image.Image],
+        all_ref_paths: List[str],
+        video_path: str,
+        parse_result: ParseResult,
+        reference_used: dict,
+    ) -> tuple:
+        """
+        分布式 Self-Critique 循环 - 所有 rank 都参与
+
+        关键修复：
+          - VLM 分析只在 rank 0 上执行（避免重复 API 调用）
+          - 重试决策通过 broadcast 同步给所有 rank
+          - generator.generate() 由所有 rank 一起执行（NCCL 同步）
+
+        这样可以避免 NCCL 超时死锁。
+        """
+        import torch.distributed as dist
+        import json
+        import shutil
+        from datetime import datetime
+
+        if self.is_rank0:
+            print(f"\n[Critique] ── 开始 Self-Critique 循环 (Shot {shot.shot_id}) ──")
+
+        critique_metadata = {"critique_enabled": True}
+        final_video_path = video_path
+        best_score = 0.0
+        best_video_path = video_path
+        critique_history = []
+
+        # ── 创建 Critique 调试目录 ──────────────────────────────────────────────
+        # 目录结构: output_dir/critique_debug/shot_XXX/
+        #   ├── attempt_1/
+        #   │   ├── video.mp4              # 该次尝试的视频
+        #   │   ├── critique_result.json   # VLM 分析结果
+        #   │   ├── issues.txt             # 问题列表（人类可读）
+        #   │   └── params.json            # 生成参数
+        #   ├── attempt_2/
+        #   │   └── ...
+        #   ├── summary.json               # 整体汇总
+        #   └── critique.log               # 完整日志
+        critique_debug_dir = None
+        critique_log_file = None
+        if self.is_rank0:
+            critique_debug_dir = os.path.join(
+                self.output_dir, "critique_debug", f"shot_{shot.shot_id:03d}"
+            )
+            os.makedirs(critique_debug_dir, exist_ok=True)
+
+            # ── 保存参考图到 ref_images/ 子目录 ────────────────────────────────
+            if reference_used:
+                ref_images_dir = os.path.join(critique_debug_dir, "ref_images")
+                os.makedirs(ref_images_dir, exist_ok=True)
+                for entity_id, ref_paths in reference_used.items():
+                    for idx, ref_path in enumerate(ref_paths):
+                        try:
+                            ext = os.path.splitext(ref_path)[1] or ".jpg"
+                            dst_name = f"{entity_id}_{idx:02d}{ext}"
+                            shutil.copy2(ref_path, os.path.join(ref_images_dir, dst_name))
+                        except Exception as e:
+                            print(f"[Critique] 复制参考图失败 {ref_path}: {e}")
+
+            critique_log_file = open(
+                os.path.join(critique_debug_dir, "critique.log"), "w", encoding="utf-8"
+            )
+            critique_log_file.write(f"=== Self-Critique Debug Log ===\n")
+            critique_log_file.write(f"Shot: {shot.shot_id}\n")
+            critique_log_file.write(f"Start Time: {datetime.now().isoformat()}\n")
+            critique_log_file.write(f"Shot Text: {shot.text}\n")
+            critique_log_file.write(f"Reference Images: {list(reference_used.keys())}\n")
+            for entity_id, ref_paths in reference_used.items():
+                critique_log_file.write(f"  - {entity_id}: {ref_paths}\n")
+            critique_log_file.write(f"{'='*60}\n\n")
+
+        # 准备实体信息（所有 rank 都需要）
+        expected_entities = [
+            {
+                "entity_id": e.entity_id,
+                "type": e.type,
+                "text_description": e.text_description,
+            }
+            for e in parse_result.entities
+            if e.grounding_priority in ("high", "medium")
+        ]
+        entity_counts = [
+            {"entity_type": ec.entity_type, "expected_count": ec.expected_count}
+            for ec in parse_result.entity_counts
+        ] if parse_result.entity_counts else None
+
+        current_params = {
+            "ip_adapter_scale": self.generator.config.guide_scale_img,
+            "guide_scale_text": self.generator.config.guide_scale_text,
+            "num_inference_steps": self.generator.config.num_inference_steps,
+            "seed": self.generator.config.seed,
+        }
+
+        for attempt in range(self.critique_max_retries + 1):
+            # ── Step 1: Rank 0 执行 VLM Critique ──
+            if self.is_rank0:
+                print(f"[Critique] 尝试 {attempt + 1}/{self.critique_max_retries + 1}: 分析视频...")
+                critique_result = self.video_critic.critique(
+                    video_path=final_video_path,
+                    reference_images=reference_used,
+                    expected_entities=expected_entities,
+                    shot_text=shot.text,
+                    entity_counts=entity_counts,
+                )
+                score = critique_result.overall_score
+                passed = critique_result.passed
+
+                # ── 保存该次尝试的调试信息 ──────────────────────────────────────
+                attempt_dir = os.path.join(critique_debug_dir, f"attempt_{attempt + 1}")
+                os.makedirs(attempt_dir, exist_ok=True)
+
+                # 1. 复制当前视频到调试目录
+                try:
+                    video_ext = os.path.splitext(final_video_path)[1] or ".mp4"
+                    shutil.copy2(final_video_path, os.path.join(attempt_dir, f"video{video_ext}"))
+                except Exception as e:
+                    critique_log_file.write(f"[WARN] 复制视频失败: {e}\n")
+
+                # 2. 保存 Critique 结果为 JSON
+                critique_result_dict = {
+                    "overall_score": score,
+                    "passed": passed,
+                    "threshold": critique_result.threshold if hasattr(critique_result, 'threshold') else 0.7,
+                    "num_issues": len(critique_result.issues),
+                    "issues": [
+                        {
+                            "severity": issue.severity.value if hasattr(issue.severity, 'value') else str(issue.severity),
+                            "category": issue.category if hasattr(issue, 'category') else "unknown",
+                            "description": issue.description,
+                            "entity_id": issue.entity_id if hasattr(issue, 'entity_id') else None,
+                        }
+                        for issue in critique_result.issues
+                    ],
+                    "repair_suggestions": [
+                        {
+                            "action": s.action if hasattr(s, 'action') else str(s),
+                            "details": s.details if hasattr(s, 'details') else "",
+                        }
+                        for s in (critique_result.repair_suggestions if hasattr(critique_result, 'repair_suggestions') else [])
+                    ],
+                }
+                with open(os.path.join(attempt_dir, "critique_result.json"), "w", encoding="utf-8") as f:
+                    json.dump(critique_result_dict, f, ensure_ascii=False, indent=2)
+
+                # 3. 保存人类可读的问题列表
+                with open(os.path.join(attempt_dir, "issues.txt"), "w", encoding="utf-8") as f:
+                    f.write(f"=== Critique Issues (Attempt {attempt + 1}) ===\n")
+                    f.write(f"Score: {score:.2f} | Passed: {passed}\n")
+                    f.write(f"{'='*50}\n\n")
+                    severity_icons = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}
+                    for i, issue in enumerate(critique_result.issues, 1):
+                        sev = issue.severity.value if hasattr(issue.severity, 'value') else str(issue.severity)
+                        icon = severity_icons.get(sev, "⚪")
+                        f.write(f"{i}. {icon} [{sev.upper()}] {issue.description}\n\n")
+                    if critique_result.repair_suggestions if hasattr(critique_result, 'repair_suggestions') else []:
+                        f.write(f"\n{'='*50}\n")
+                        f.write("=== Repair Suggestions ===\n")
+                        for s in critique_result.repair_suggestions:
+                            action = s.action if hasattr(s, 'action') else str(s)
+                            details = s.details if hasattr(s, 'details') else ""
+                            f.write(f"- {action}: {details}\n")
+
+                # 4. 保存当前参数
+                with open(os.path.join(attempt_dir, "params.json"), "w", encoding="utf-8") as f:
+                    json.dump(current_params, f, ensure_ascii=False, indent=2)
+
+                # 5. 写入日志
+                critique_log_file.write(f"\n--- Attempt {attempt + 1} ---\n")
+                critique_log_file.write(f"Time: {datetime.now().isoformat()}\n")
+                critique_log_file.write(f"Video: {final_video_path}\n")
+                critique_log_file.write(f"Score: {score:.2f} | Passed: {passed}\n")
+                critique_log_file.write(f"Params: {current_params}\n")
+                critique_log_file.write(f"Issues ({len(critique_result.issues)}):\n")
+                for issue in critique_result.issues:
+                    sev = issue.severity.value if hasattr(issue.severity, 'value') else str(issue.severity)
+                    critique_log_file.write(f"  [{sev}] {issue.description}\n")
+                critique_log_file.flush()
+
+                # 记录历史
+                critique_history.append({
+                    "attempt": attempt + 1,
+                    "score": score,
+                    "passed": passed,
+                    "num_issues": len(critique_result.issues),
+                    "critical_issues": len(critique_result.critical_issues),
+                    "high_issues": len(critique_result.high_issues),
+                    "params": current_params.copy(),
+                    "debug_dir": attempt_dir,  # 记录调试目录路径
+                })
+
+                # 更新最佳结果
+                if score > best_score:
+                    best_score = score
+                    best_video_path = final_video_path
+
+                # 决定是否需要重试
+                need_retry = not passed and attempt < self.critique_max_retries
+                retry_params = None
+
+                if passed:
+                    print(f"[Critique] ✅ 通过！分数: {score:.2f}")
+                    critique_log_file.write(f"Result: ✅ PASSED\n")
+                elif not need_retry:
+                    print(f"[Critique] ⚠️ 达到最大重试次数，使用最佳结果 (score={best_score:.2f})")
+                    critique_log_file.write(f"Result: ⚠️ MAX RETRIES REACHED, using best (score={best_score:.2f})\n")
+                    final_video_path = best_video_path
+                else:
+                    # 生成修复参数
+                    print(f"[Critique] ❌ 未通过 (score={score:.2f})，准备修复...")
+                    critique_log_file.write(f"Result: ❌ FAILED, preparing retry...\n")
+                    for issue in critique_result.issues[:3]:
+                        icon = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}.get(
+                            issue.severity.value, "⚪"
+                        )
+                        print(f"[Critique]    {icon} {issue.description}")
+
+                    # ── 根因分析 & 智能重试（新增）──────────────────────────────────
+                    if self.enable_smart_retry and self.root_cause_analyzer:
+                        # Step 1: 诊断问题根因
+                        diagnosis = self.root_cause_analyzer.diagnose(critique_result)
+
+                        # Step 2: 基于根因选择重试策略
+                        if self.smart_retry_executor:
+                            # 记录上一次分数
+                            if attempt == 0:
+                                self.smart_retry_executor.reset()  # 新 shot 开始时重置
+                            self.smart_retry_executor.record_result(score, passed)
+
+                            # 获取当前问题类别用于策略选择
+                            current_issues = [c.category.value for c in diagnosis.all_causes] if diagnosis.all_causes else []
+
+                            # 选择策略
+                            strategy = self.smart_retry_executor.select_strategy(
+                                diagnosis=diagnosis,
+                                attempt=attempt + 1,
+                                current_score=score,
+                            )
+
+                            if strategy:
+                                # 准备实体数量信息
+                                entity_count_dict = {}
+                                if entity_counts:
+                                    for ec in entity_counts:
+                                        entity_count_dict[ec["entity_type"]] = ec["expected_count"]
+
+                                # 应用策略
+                                retry_params, new_prompt = self.smart_retry_executor.apply_strategy(
+                                    strategy=strategy,
+                                    current_params=current_params,
+                                    current_prompt=prompt,
+                                    shot_id=shot.shot_id,
+                                    entity_counts=entity_count_dict,
+                                )
+
+                                # 保存策略信息到调试目录
+                                strategy_info = {
+                                    "target_category": strategy.target_category.value,
+                                    "actions": [a.value for a in strategy.actions],
+                                    "reasoning": strategy.reasoning,
+                                    "diagnosis_summary": diagnosis.diagnosis_summary,
+                                }
+                                with open(os.path.join(attempt_dir, "strategy.json"), "w", encoding="utf-8") as f:
+                                    json.dump(strategy_info, f, ensure_ascii=False, indent=2)
+                                critique_log_file.write(f"Smart Retry Strategy: {strategy.target_category.value}\n")
+                                critique_log_file.write(f"Actions: {[a.value for a in strategy.actions]}\n")
+                            else:
+                                # 无可用策略，回退到原有逻辑
+                                repair_generator = RepairStrategyGenerator()
+                                retry_params = repair_generator.generate_repair_params(
+                                    critique_result=critique_result,
+                                    current_params=current_params,
+                                )
+                        else:
+                            # SmartRetryExecutor 不可用，回退
+                            repair_generator = RepairStrategyGenerator()
+                            retry_params = repair_generator.generate_repair_params(
+                                critique_result=critique_result,
+                                current_params=current_params,
+                            )
+                    else:
+                        # 原有逻辑：使用 RepairStrategyGenerator
+                        repair_generator = RepairStrategyGenerator()
+                        retry_params = repair_generator.generate_repair_params(
+                            critique_result=critique_result,
+                            current_params=current_params,
+                        )
+
+                    if retry_params.get("force_t2v"):
+                        print(f"[Critique] 建议切换到 T2V 模式，但本次保留 S2V，仅调整参数")
+                        critique_log_file.write(f"Note: T2V suggested but keeping S2V\n")
+                        del retry_params["force_t2v"]
+
+                    # 确保有新 seed
+                    if retry_params.get("seed") == current_params.get("seed"):
+                        import random
+                        retry_params["seed"] = self.base_seed + shot.shot_id + (attempt + 1) * 1000 + random.randint(0, 999)
+
+                    # 保存修复参数
+                    with open(os.path.join(attempt_dir, "retry_params.json"), "w", encoding="utf-8") as f:
+                        json.dump(retry_params, f, ensure_ascii=False, indent=2)
+                    critique_log_file.write(f"Retry params: {retry_params}\n")
+
+                # 准备广播数据: [need_retry, retry_params, final_video_path, best_score]
+                broadcast_data = [need_retry, retry_params, final_video_path, best_score]
+            else:
+                broadcast_data = [None, None, None, None]
+
+            # ── Step 2: 广播重试决策给所有 rank ──
+            if self.world_size > 1 and dist.is_initialized():
+                dist.broadcast_object_list(broadcast_data, src=0)
+
+            need_retry, retry_params, final_video_path, best_score = broadcast_data
+
+            # 不需要重试，退出循环
+            if not need_retry:
+                break
+
+            # ── Step 3: 所有 rank 一起重新生成视频 ──
+            if retry_params:
+                # 更新生成参数（所有 rank 都需要更新）
+                params_changed = []
+                if retry_params.get("ip_adapter_scale") != current_params.get("ip_adapter_scale"):
+                    old_val = current_params.get("ip_adapter_scale", 0)
+                    new_val = retry_params["ip_adapter_scale"]
+                    self.generator.config.guide_scale_img = new_val
+                    params_changed.append(f"ip_adapter_scale: {old_val:.2f} → {new_val:.2f}")
+
+                # 步数修改：设置上限为 50（Phantom/Wan 使用 UniPC solver，超过 50 步边际收益递减）
+                if retry_params.get("num_inference_steps") != current_params.get("num_inference_steps"):
+                    old_val = current_params.get("num_inference_steps", 50)
+                    new_val = retry_params["num_inference_steps"]
+                    max_steps = 50  # 基于 Phantom 官方默认值，UniPC solver 下 50 步足够
+                    if new_val > max_steps:
+                        if self.is_rank0:
+                            print(f"[Critique] 步数建议 {new_val} 超过上限，限制为 {max_steps}")
+                        new_val = max_steps
+                    if new_val != old_val:
+                        self.generator.config.num_inference_steps = new_val
+                        params_changed.append(f"steps: {old_val} → {new_val}")
+
+                if retry_params.get("seed") != current_params.get("seed"):
+                    new_seed = retry_params["seed"]
+                    self.generator.config.seed = new_seed
+                    params_changed.append(f"seed → {new_seed}")
+
+                current_params = retry_params
+
+                if self.is_rank0 and params_changed:
+                    print(f"[Critique] 参数调整: {', '.join(params_changed)}")
+                    critique_log_file.write(f"Params changed: {', '.join(params_changed)}\n")
+
+            retry_video_path = os.path.join(
+                self.output_dir, "videos",
+                f"shot_{shot.shot_id:03d}_critique_retry{attempt + 1}.mp4"
+            )
+
+            # 清理 VRAM（所有 rank 都执行）
+            self._cleanup_vram_before_retry()
+
+            if self.is_rank0:
+                print(f"[Critique] 重新生成视频...")
+                critique_log_file.write(f"Regenerating video: {retry_video_path}\n")
+                critique_log_file.flush()
+
+            try:
+                # 【关键】所有 rank 一起调用 generate()，保持 NCCL 同步
+                self.generator.generate(
+                    text_prompt=prompt,
+                    references=all_ref_images,
+                    output_path=retry_video_path,
+                )
+                final_video_path = retry_video_path
+            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                if self.is_rank0:
+                    print(f"[Critique] ❌ 生成失败: {e}")
+                    print(f"[Critique] 终止重试，使用最佳结果 (score={best_score:.2f})")
+                    critique_log_file.write(f"ERROR: Generation failed - {e}\n")
+                    critique_history.append({
+                        "attempt": attempt + 1,
+                        "score": 0,
+                        "passed": False,
+                        "error": str(e),
+                    })
+                self._cleanup_vram_before_retry()
+                final_video_path = best_video_path
+                break
+
+        # 构建元数据
+        critique_metadata = {
+            "critique_enabled": True,
+            "final_attempt": len(critique_history),
+            "final_score": critique_history[-1]["score"] if critique_history else 0,
+            "final_passed": critique_history[-1].get("passed", False) if critique_history else False,
+            "best_score": best_score,
+            "critique_history": critique_history,
+            "debug_dir": critique_debug_dir,  # 添加调试目录到元数据
+        }
+
+        # ── 保存汇总信息并关闭日志 ────────────────────────────────────────────
+        if self.is_rank0 and critique_debug_dir:
+            # 保存汇总 JSON
+            summary = {
+                "shot_id": shot.shot_id,
+                "shot_text": shot.text,
+                "total_attempts": len(critique_history),
+                "final_score": best_score,
+                "final_passed": critique_history[-1].get("passed", False) if critique_history else False,
+                "final_video": final_video_path,
+                "best_video": best_video_path,
+                "reference_images": {k: v for k, v in reference_used.items()},
+                "critique_history": critique_history,
+            }
+            with open(os.path.join(critique_debug_dir, "summary.json"), "w", encoding="utf-8") as f:
+                json.dump(summary, f, ensure_ascii=False, indent=2)
+
+            # 关闭日志文件
+            critique_log_file.write(f"\n{'='*60}\n")
+            critique_log_file.write(f"=== Critique Complete ===\n")
+            critique_log_file.write(f"End Time: {datetime.now().isoformat()}\n")
+            critique_log_file.write(f"Total Attempts: {len(critique_history)}\n")
+            critique_log_file.write(f"Final Score: {best_score:.2f}\n")
+            critique_log_file.write(f"Final Video: {final_video_path}\n")
+            critique_log_file.close()
+
+            print(f"[Critique] 调试信息已保存到: {critique_debug_dir}")
+
+        # ── 记录生成经验（新增）─────────────────────────────────────────────────
+        if self.is_rank0 and self.enable_experience_memory and self.experience_advisor:
+            try:
+                # 检测镜头类型
+                shot_text_lower = shot.text.lower()
+                if any(kw in shot_text_lower for kw in ["close-up", "closeup", "close up"]):
+                    shot_type = "closeup"
+                elif any(kw in shot_text_lower for kw in ["wide shot", "wide angle", "full shot"]):
+                    shot_type = "wide"
+                else:
+                    shot_type = "medium"
+
+                # 创建场景指纹
+                fingerprint = self.experience_advisor.create_fingerprint(
+                    entities=expected_entities,
+                    shot_text=shot.text,
+                    shot_type=shot_type,
+                )
+
+                # 收集遇到的问题类别
+                encountered_issues = []
+                if self.enable_smart_retry and self._root_cause_analyzer and critique_history:
+                    # 从历史中提取问题类别
+                    for hist in critique_history:
+                        if hist.get("num_issues", 0) > 0:
+                            # 尝试从 diagnosis 获取类别（如果保存了的话）
+                            pass
+                    # 简化：直接记录是否有 critical/high 问题
+                    for hist in critique_history:
+                        if hist.get("critical_issues", 0) > 0:
+                            encountered_issues.append("identity")  # 严重问题通常是身份相关
+                        if hist.get("high_issues", 0) > 0:
+                            encountered_issues.append("quality")
+                    encountered_issues = list(set(encountered_issues))
+
+                # 收集使用的策略
+                strategies_used = []
+                if self.enable_smart_retry and self._smart_retry_executor:
+                    for strategy in self._smart_retry_executor.strategy_history:
+                        # 判断策略是否成功（下一次分数是否提升）
+                        idx = self._smart_retry_executor.strategy_history.index(strategy)
+                        if idx + 1 < len(self._smart_retry_executor.score_history):
+                            prev_score = self._smart_retry_executor.score_history[idx]
+                            next_score = self._smart_retry_executor.score_history[idx + 1]
+                            succeeded = next_score > prev_score
+                        else:
+                            succeeded = critique_history[-1].get("passed", False) if critique_history else False
+                        strategies_used.append((strategy.target_category.value, succeeded))
+
+                # 记录经验
+                final_passed = critique_history[-1].get("passed", False) if critique_history else False
+                self.experience_advisor.record_generation(
+                    fingerprint=fingerprint,
+                    generation_mode="phantom",  # 只有 S2V 模式才会进入 critique 循环
+                    params=current_params,
+                    attempts=len(critique_history),
+                    issues=encountered_issues,
+                    strategies_used=strategies_used,
+                    final_score=best_score,
+                    success=final_passed,
+                )
+                print(f"[Critique] 📚 经验已记录 (fingerprint={fingerprint.to_hash()})")
+            except Exception as e:
+                print(f"[Critique] ⚠️ 记录经验失败: {e}")
+
+        if self.is_rank0:
+            print(f"[Critique] ── Self-Critique 完成 (最终分数: {best_score:.2f}) ──\n")
+
+        return final_video_path, critique_metadata
+
+    # ── Self-Critique 循环（原版，保留兼容性）────────────────────────────────────
 
     def _generate_with_critique(
         self,
@@ -1438,12 +2130,36 @@ class T2VGroundingPipeline:
                 f"shot_{shot.shot_id:03d}_critique_retry{attempt + 1}.mp4"
             )
 
+            # 【关键修复】重新生成前清理 VRAM，防止 OOM
+            # 问题：上一次生成的中间张量可能仍在 GPU 内存中
+            # 解决：强制 GC + empty_cache，确保 VRAM 可用
+            self._cleanup_vram_before_retry()
+
             print(f"[Critique] 重新生成视频...")
-            self.generator.generate(
-                text_prompt=prompt,
-                references=all_ref_images,
-                output_path=retry_video_path,
-            )
+            try:
+                self.generator.generate(
+                    text_prompt=prompt,
+                    references=all_ref_images,
+                    output_path=retry_video_path,
+                )
+            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                # OOM 或 CUDA 错误时，优雅处理而非死锁
+                print(f"[Critique] ❌ 生成失败 (可能是 OOM): {e}")
+                print(f"[Critique] 终止重试，使用最佳结果 (score={best_score:.2f})")
+                # 尝试再次清理 VRAM
+                self._cleanup_vram_before_retry()
+                final_video_path = best_video_path
+                critique_history.append({
+                    "attempt": attempt + 1,
+                    "score": 0,
+                    "passed": False,
+                    "num_issues": -1,
+                    "critical_issues": -1,
+                    "high_issues": -1,
+                    "params": current_params.copy(),
+                    "error": str(e),
+                })
+                break
 
             final_video_path = retry_video_path
 

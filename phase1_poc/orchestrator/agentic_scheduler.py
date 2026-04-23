@@ -230,7 +230,7 @@ class AgenticScheduler:
 
     def __init__(
         self,
-        model: str = "claude-sonnet-4-6-Anthropic",
+        model: str = "claude-sonnet-4-6",
         min_benefit_threshold: float = 0.15,  # 最小收益阈值，低于此值不优化
         enable_heuristic_fallback: bool = True,  # LLM 失败时使用启发式
         verbose: bool = True,

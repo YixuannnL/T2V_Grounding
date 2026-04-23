@@ -347,8 +347,11 @@ class SmartEntityRegistry:
         # 假设 self.clip_model 是 (model, preprocess) tuple
         model, preprocess = self.clip_model
 
+        # 获取模型所在设备
+        device = next(model.parameters()).device
+
         image = Image.open(image_path).convert("RGB")
-        image_input = preprocess(image).unsqueeze(0)
+        image_input = preprocess(image).unsqueeze(0).to(device)  # 移动到模型所在设备
 
         with torch.no_grad():
             embedding = model.encode_image(image_input)

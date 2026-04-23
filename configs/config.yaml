@@ -76,7 +76,7 @@ pipeline:
 agent:
   max_retries: 3
   consistency_threshold: 0.70
-  model: "claude-sonnet-4-6-Anthropic"
+  model: "claude-sonnet-4-6"
 
 # ── Agentic 参考图选择（v3.0 新增）─────────────────────────────────────────────
 # 使用 VLM Agent 智能选择参考图，替代传统的 InsightFace 打分

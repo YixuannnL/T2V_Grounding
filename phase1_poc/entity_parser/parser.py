@@ -200,7 +200,7 @@ class CloseupLightingAnalysis:
 
 
 class EntityParser:
-    def __init__(self, api_key: Optional[str] = None, model: str = "claude-sonnet-4-6-Anthropic"):
+    def __init__(self, api_key: Optional[str] = None, model: str = "claude-sonnet-4-6"):
         self.llm = LLMClient(api_key=api_key, model=model)
         self._known_entities: List[Entity] = []  # 跨镜头已知实体
         self._global_caption: Optional[str] = None  # 全局背景描述

@@ -43,8 +43,8 @@ MODEL_ALIASES = {
     "claude-sonnet-4-5-20250929":           "claude-sonnet-4-5-20250929",
     "claude-sonnet-4-5-20250929-Anthropic": "claude-sonnet-4-5-20250929-Anthropic",
     # ── Sonnet 4.6 ────────────────────────────────────────────────────────────
-    "claude-sonnet-4-6":                    "claude-sonnet-4-6-Anthropic",
-    "claude-sonnet-4-6-Anthropic":          "claude-sonnet-4-6-Anthropic",
+    "claude-sonnet-4-6":                    "claude-sonnet-4-6",
+    "claude-sonnet-4-6":          "claude-sonnet-4-6",
     "claude-sonnet-4-6-chuangzuo":          "claude-sonnet-4-6-chuangzuo",
     "claude-sonnet-4-6-chuangzuo-2":        "claude-sonnet-4-6-chuangzuo-2",
     # ── Opus 4.5 ──────────────────────────────────────────────────────────────
@@ -153,13 +153,20 @@ class LLMClient:
             full_messages.append({"role": "system", "content": system})
         full_messages.extend(messages)
 
-        response = self.client.chat.completions.create(
-            model=_resolve_model(model) if model else self.model,
-            messages=full_messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-        return response.choices[0].message.content
+        for attempt in range(5):
+            try:
+                response = self.client.chat.completions.create(
+                    model=_resolve_model(model) if model else self.model,
+                    messages=full_messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                return response.choices[0].message.content
+            except RateLimitError as e:
+                wait = 15 * (2 ** attempt)
+                print(f"[LLMClient] 429 限流，{wait}s 后重试 (attempt {attempt+1}/5): {e}")
+                time.sleep(wait)
+        raise RuntimeError("[LLMClient] 达到最大重试次数，API 持续限流")
 
     # ── 多模态对话（支持图片）──────────────────────────────────────────────────
     def chat_with_images(
