@@ -90,6 +90,13 @@ class RegistryConfig:
     eviction_quality_threshold: float = 0.5   # 低于此分数可被淘汰
     eviction_check_interval: int = 5          # 每处理多少个 shot 触发一次淘汰检查
 
+    # ── VLM Quality Gate 配置 ──
+    enable_vlm_quality_gate: bool = True      # 是否启用 VLM 质量门控
+    vlm_gate_model: str = "claude-sonnet-4-6" # VLM 模型
+    vlm_gate_for_objects: bool = True         # 是否对 object 类型启用（建议开启）
+    vlm_gate_for_characters: bool = False     # 是否对 character 类型启用（已有 face 检测，可选）
+    vlm_gate_for_locations: bool = False      # 是否对 location 类型启用（通常不需要）
+
 
 class SmartEntityRegistry:
     """
@@ -100,6 +107,7 @@ class SmartEntityRegistry:
     2. 有主动淘汰机制
     3. 维护多样性（不同角度、光线）
     4. 支持 VLM 审计
+    5. 【新增】VLM Quality Gate：对 object 等类型做可识别性检查
     """
 
     def __init__(
@@ -112,6 +120,8 @@ class SmartEntityRegistry:
         self.config = config or RegistryConfig()
         self.clip_model = clip_model
         self._shot_counter = 0  # 用于触发定期淘汰
+        self._quality_gate = None  # VLM 质量门控（延迟初始化）
+        self._entity_descriptions = {}  # 缓存实体描述，用于 VLM 检查
         self._init_db()
 
     def _init_db(self):
@@ -165,6 +175,7 @@ class SmartEntityRegistry:
         entity_id: str,
         entry: ReferenceEntry,
         force: bool = False,
+        entity_description: str = "",  # 【新增】实体描述，用于 VLM 检查
     ) -> Tuple[bool, str]:
         """
         智能注册参考图
@@ -172,18 +183,24 @@ class SmartEntityRegistry:
         与旧版区别：不是直接 INSERT，而是经过多层过滤：
         1. 质量门槛检查
         2. 人脸置信度检查（character）
-        3. 相似度去重
-        4. 容量检查（超限则触发淘汰）
+        3. 【新增】VLM 可识别性检查（object）
+        4. 相似度去重
+        5. 容量检查（超限则触发淘汰）
 
         Args:
             entity_id: 实体 ID
             entry: 参考图记录
             force: 是否强制注册（跳过过滤）
+            entity_description: 实体文本描述（用于 VLM 检查）
 
         Returns:
             (success, reason): 是否成功注册，以及原因说明
         """
         cfg = self.config
+
+        # 缓存实体描述（供后续使用）
+        if entity_description:
+            self._entity_descriptions[entity_id] = entity_description
 
         # ── Check 1: 质量门槛 ──────────────────────────────────────────────────
         if not force and entry.quality_score < cfg.min_quality_to_register:
@@ -197,6 +214,26 @@ class SmartEntityRegistry:
                 reason = f"人脸置信度 {entry.id_confidence:.2f} < 阈值 {cfg.min_id_confidence}"
                 print(f"[SmartRegistry] 拒绝注册 {entity_id}: {reason}")
                 return False, reason
+
+        # ── Check 2.5【新增】: VLM 可识别性检查 ────────────────────────────────
+        # 对 object 类型（如 obj_horse）做 VLM 检查，避免纯黑剪影等无效参考图入库
+        if not force and self._should_vlm_check(entity_id):
+            vlm_passed, vlm_reason, vlm_score = self._vlm_quality_check(
+                entry.crop_path,
+                entity_id,
+                entity_description or self._entity_descriptions.get(entity_id, ""),
+            )
+            if not vlm_passed:
+                reason = f"VLM 质量检查未通过: {vlm_reason}"
+                print(f"[SmartRegistry] 🚫 拒绝注册 {entity_id}: {reason}")
+                # 记录到淘汰日志（方便追溯）
+                self._log_vlm_rejection(entity_id, entry.crop_path, vlm_reason)
+                return False, reason
+            else:
+                # VLM 通过，可选：用 VLM 建议的分数覆盖原始分数
+                if vlm_score > 0:
+                    print(f"[SmartRegistry] ✅ VLM 检查通过 {entity_id}: "
+                          f"建议分数 {vlm_score:.2f} (原始 {entry.quality_score:.2f})")
 
         # ── Check 3: 相似度去重 ────────────────────────────────────────────────
         if not force and self.clip_model is not None:
@@ -665,13 +702,13 @@ class SmartEntityRegistry:
 
         active_clause = "AND is_active = 1" if active_only else ""
 
-        if anchor_strategy == "earliest_high_quality":
+        if anchor_strategy == "earliest_high_quality" or anchor_strategy == "earliest_good":
             # 锚点优先 → 早期 shot 优先 → 质量优先
             order = "is_anchor DESC, shot_id ASC, quality_score DESC"
         elif anchor_strategy == "best_quality":
             order = "is_anchor DESC, quality_score DESC, shot_id ASC"
         else:
-            order = "is_anchor DESC, shot_id DESC, quality_score DESC"
+            order = "is_anchor DESC, shot_id ASC, quality_score DESC"  # 默认也是早期优先
 
         rows = conn.execute(f"""
             SELECT entity_id, shot_id, frame_path, crop_path, quality_score,
@@ -781,6 +818,87 @@ class SmartEntityRegistry:
             created_at=row[6],
             id_confidence=row[7],
         )
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # VLM Quality Gate 相关方法
+    # ══════════════════════════════════════════════════════════════════════════════
+
+    def _should_vlm_check(self, entity_id: str) -> bool:
+        """判断是否需要对该实体做 VLM 检查"""
+        cfg = self.config
+        if not cfg.enable_vlm_quality_gate:
+            return False
+
+        if entity_id.startswith("obj_") and cfg.vlm_gate_for_objects:
+            return True
+        if entity_id.startswith("char_") and cfg.vlm_gate_for_characters:
+            return True
+        if entity_id.startswith("loc_") and cfg.vlm_gate_for_locations:
+            return True
+
+        return False
+
+    def _get_quality_gate(self):
+        """延迟初始化 VLM Quality Gate"""
+        if self._quality_gate is None:
+            try:
+                from reference_manager.ref_quality_gate import ReferenceQualityGate
+                self._quality_gate = ReferenceQualityGate(
+                    model=self.config.vlm_gate_model,
+                    enabled=True,
+                    cache_results=True,
+                )
+                print(f"[SmartRegistry] 🔍 VLM Quality Gate 已初始化 (model={self.config.vlm_gate_model})")
+            except Exception as e:
+                print(f"[SmartRegistry] ⚠️ VLM Quality Gate 初始化失败: {e}")
+                self._quality_gate = None
+        return self._quality_gate
+
+    def _vlm_quality_check(
+        self,
+        crop_path: str,
+        entity_id: str,
+        entity_description: str,
+    ) -> Tuple[bool, str, float]:
+        """
+        调用 VLM 检查 crop 是否值得入库
+
+        Returns:
+            (passed, reason, suggested_score)
+        """
+        gate = self._get_quality_gate()
+        if gate is None:
+            # VLM 不可用，默认通过
+            return True, "VLM unavailable", 0.0
+
+        result = gate.check(crop_path, entity_id, entity_description)
+        return (
+            result.should_register,
+            f"{result.reason.value}: {result.detail}",
+            result.suggested_score,
+        )
+
+    def _log_vlm_rejection(self, entity_id: str, crop_path: str, reason: str):
+        """记录 VLM 拒绝到淘汰日志"""
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            INSERT INTO eviction_log
+            (entity_id, crop_path, quality_score, reason, evicted_at, replaced_by)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            entity_id,
+            crop_path,
+            0.0,  # VLM 拒绝的没有入库，quality_score 设为 0
+            f"vlm_rejected: {reason}",
+            datetime.now().isoformat(),
+            None,
+        ))
+        conn.commit()
+        conn.close()
+
+    def set_entity_description(self, entity_id: str, description: str):
+        """设置实体描述（供 VLM 检查使用）"""
+        self._entity_descriptions[entity_id] = description
 
     def stats(self) -> dict:
         """返回统计信息"""

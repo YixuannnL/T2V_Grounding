@@ -71,7 +71,7 @@ A final design choice reinforces our agentic flexibility: we adopt \textbf{subje
 
     \item \textbf{Grounding-in-the-Loop:} A self-bootstrapping paradigm where references are extracted from generated videos via visual grounding, ensuring stylistic consistency through agentic self-perception.
 
-    \item \textbf{Quality-Aware Agentic Shot Scheduling:} We observe that the quality of visual grounding varies dramatically across shots due to camera distance and lighting. We propose an agentic planning approach where an LLM constructs a dependency-aware execution DAG, enabling ``reference bootstrapping''---generating high-quality close-up shots first to establish strong anchors, even when they appear later in narrative order.
+    \item \textbf{Quality-Aware Agentic Shot Scheduling:} We observe that the quality of visual grounding varies dramatically across shots due to camera distance and lighting. We propose an agentic planning approach where an LLM constructs a dependency-aware execution DAG, enabling ``reference bootstrapping''---generating high-quality close-up shots first to establish strong anchors, even when they appear later in narrative order. For extreme cases where DAG scheduling cannot obtain high-quality references, we provide a \textbf{T2I fallback mechanism} with LLM-based quality assessment and dynamic retry budgets.
 
     \item \textbf{Runtime agentic decisions:} Multiple perception-reasoning-action mechanisms---generation verification, subject-aware routing, lighting analysis, frontal-aware filtering, \textbf{root cause analysis for targeted retry}, and \textbf{cross-session experience learning}---that actively adapt to generation outcomes.
 
@@ -81,7 +81,90 @@ A final design choice reinforces our agentic flexibility: we adopt \textbf{subje
 % ============================================================================
 \section{Related Work}
 
-Omit for now.
+\subsection{Multi-Shot Video Generation}
+
+Text-to-video (T2V) models have progressed rapidly from GAN-based~\cite{text2video_zero} and diffusion-based~\cite{blattmann2023align,animatediff} architectures to DiT-based systems~\cite{sora,yang2024cogvideox,wan2024wan,moviegen} capable of producing photorealistic single-shot clips.
+However, extending these to multi-shot scenarios---where characters, objects, and scenes must remain visually consistent across an entire narrative---remains a fundamental challenge.
+
+Existing multi-shot methods can be broadly grouped by how they maintain cross-shot consistency.
+\textbf{Architecture-level approaches} embed consistency directly into the generation backbone, requiring dedicated training or fine-tuning.
+StoryDiffusion~\cite{storydiffusion} introduces consistent self-attention to share visual features across frames in a batch;
+ShotStream~\cite{shotstream} proposes a streaming DiT architecture for temporally extended narratives;
+Mask2DiT~\cite{mask2dit} extends DiT with dual-masking for scene transitions;
+InfinityStory~\cite{infinitystory} designs character-aware shot transitions for unlimited-length stories;
+StoryMem~\cite{storymem} and VideoMemory~\cite{videomemory} incorporate explicit memory modules to cache and recall entity appearances;
+OneStory~\cite{onestory} reformulates multi-shot generation as next-shot prediction with adaptive memory;
+FilmWeaver~\cite{filmweaver} maintains character and background consistency via cache-guided autoregressive diffusion;
+and HoloCine~\cite{holocine} generates entire cinematic multi-shot narratives holistically rather than shot-by-shot.
+\textbf{Pipeline-level approaches} instead keep the generative backbone frozen and decompose multi-shot generation into planning and per-shot execution stages.
+VideoStudio~\cite{videostudio} first extends T2V to multi-scene scenarios with LLM-planned entity-consistent scripts;
+MultiShotMaster~\cite{multishotmaster} proposes a controllable framework with entity-level layout planning;
+STAGE~\cite{stage} anchors generation on storyboard keyframes for cinematic multi-shot narratives;
+ShotDirector~\cite{shotdirector} introduces directorially controllable shot transitions;
+ShotAdapter~\cite{shotadapter} adds a lightweight adapter to diffusion models for multi-shot generation with discrete transitions;
+VideoGen-of-Thought~\cite{videogenofthought} employs step-by-step chain-of-thought reasoning for multi-shot narrative planning;
+MovieDreamer~\cite{moviedreamer} adopts hierarchical generation combining autoregressive and diffusion models for movie-length sequences;
+EchoShot~\cite{echoshot} addresses multi-shot portrait video with cross-shot face consistency;
+Gloria~\cite{gloria} introduces content anchors to maintain character appearance across shots;
+and AnyID~\cite{anyid} supports arbitrary visual references for identity preservation across scenes.
+Several systems further tackle the end-to-end movie/vlog generation problem:
+Vlogger~\cite{vlogger} generates minute-level video blogs with complex storylines and diversified scenes,
+and Captain Cinema~\cite{captaincinema} produces short movies via top-down keyframe planning with bottom-up interleaved DiT synthesis.
+Despite the breadth of these approaches, all existing methods share three common limitations:
+(i)~they offer \emph{no mechanism to inspect or correct failures at runtime}---if a character drifts in appearance or an entity is hallucinated, the error propagates to all subsequent shots;
+(ii)~pipeline-level methods critically depend on the \emph{availability and quality} of reference images, an assumption that breaks down in pure text-to-video scenarios where no external reference exists; and
+(iii)~they universally equate \emph{generation order with narrative order} (Shot~1$\to$2$\to\cdots\to N$), ignoring the fact that not all shots are equally informative for establishing entity references---a close-up yields far richer identity cues than a wide establishing shot, yet existing systems are forced to bootstrap from whichever shot comes first narratively.
+Our work addresses all three limitations simultaneously: Grounding-in-the-Loop creates a self-bootstrapping reference supply by extracting references from the generated videos themselves; the closed-loop agentic formulation detects and recovers from generation failures at runtime; and quality-aware DAG scheduling reorders the generation sequence so that the most informative shots---regardless of their narrative position---are generated first to seed the highest-quality reference bank.
+
+\subsection{Identity Preservation and Subject-Driven Generation}
+
+A closely related line of work focuses on conditioning generation on reference images to preserve subject identity---a capability our framework leverages as a building block.
+IP-Adapter~\cite{ipadapter} and PhotoMaker~\cite{photomaker} embed identity into diffusion models via cross-attention adapters for text-to-image generation.
+Extending to the video domain, subject-to-video (S2V) models such as Phantom~\cite{phantom}, DreamVideo~\cite{dreamvideo}, and LibraGen~\cite{libragen} condition video generation on subject images while preserving text alignment.
+Closed-source models such as Runway Gen-3~\cite{gen3}, Kling~\cite{kling}, Seedance~\cite{seedance}, Vidu~\cite{vidu}, Luma Dream Machine~\cite{lumadreammachine}, and MiniMax Hailuo~\cite{hailuo} also support reference-conditioned video generation with high visual fidelity.
+Both open-source and commercial S2V models provide a powerful \emph{per-shot} generation primitive: given one or more reference images, they can produce a video that faithfully depicts the referenced subjects.
+However, each generation is capped at a few seconds ($\sim$5\,s for typical DiT-based models) and cannot produce scene transitions within a single forward pass, making them inherently single-shot executors.
+They do not address the multi-shot coordination problem---how to obtain, manage, and route references across an entire narrative.
+Our framework is agnostic to the choice of per-shot executor: it can wrap either open-source models~\cite{phantom} or commercial APIs~\cite{kling,seedance} in its agentic loop, automatically extracting, evaluating, and selecting references through visual grounding to eliminate the need for manually provided reference images.
+
+\subsection{LLM-Driven and Agentic Video Generation}
+
+The success of large language models (LLMs) as general-purpose reasoners has inspired their use as planners and directors for video generation.
+VideoDirectorGPT~\cite{videodirectorgpt} first proposed using an LLM to generate structured multi-scene plans with consistent entity layouts.
+LLM-grounded Diffusion~\cite{llmgroundeddiffusion,llmgroundedvideo} leverages LLMs to produce dynamic scene layouts that spatially ground diffusion models.
+More recently, multi-agent systems have been explored for complex video production:
+StoryAgent~\cite{storyagent} decomposes storytelling into specialized agents for scripting, storyboarding, and animation;
+DreamFactory~\cite{dreamfactory} introduces multi-agent collaboration with key-frame iteration for multi-scene long videos;
+Camera Artist~\cite{cameraartist} models real-world filmmaking workflows via multi-agent collaboration;
+Automated Movie Generation~\cite{automatedmovie} employs multi-agent chain-of-thought planning;
+FilmAgent~\cite{filmagent} automates end-to-end film production in virtual 3D spaces;
+AniME~\cite{anime} designs a director-oriented multi-agent system for long animation;
+and MM-StoryAgent~\cite{mmstoryagent} extends the paradigm to immersive narrated storybooks.
+VISTA~\cite{vista} introduces test-time self-improvement, where an agent iteratively rewrites prompts to improve generation quality;
+MUSE~\cite{muse} proposes closed-loop cognitive orchestration for multi-agent story envisioning.
+Most relevant to ours, concurrent work on Agentic Video Generation~\cite{agenticvideogen} proposes LLM agents that orchestrate generation via executable event graphs with tool-constrained planning.
+
+Despite the ``agent'' terminology adopted by these methods, most operate as \emph{open-loop} systems: the LLM produces a plan before generation begins, and execution follows the plan without runtime feedback.
+Even MUSE~\cite{muse}, which introduces closed-loop orchestration, limits its feedback to prompt-level rewriting without grounding-based visual verification.
+When generation fails---wrong entity count, poor reference quality, identity mismatch---there is no mechanism for the system to perceive the failure, reason about its cause, and take corrective action.
+Our framework differs fundamentally: it is \textbf{closed-loop} at every stage.
+The LLM not only plans, but continuously monitors generation outcomes, diagnoses root causes of failures, and adaptively adjusts strategies---embodying genuine perceive-reason-act loops rather than single-pass planning.
+
+\subsection{Visual Grounding and Generation Scheduling}
+
+Visual grounding---localizing objects in images or videos from natural language descriptions---has matured significantly.
+Grounding DINO~\cite{groundingdino} marries DINO with grounded pre-training for open-set object detection from arbitrary text queries;
+GLIGEN~\cite{gligen} integrates spatial grounding conditions into text-to-image generation;
+ReferDINO~\cite{liang2025referdino} unifies referring expression comprehension and segmentation in an end-to-end model.
+These advances enable precise entity localization---yet to our knowledge, \textbf{no prior work has used visual grounding as a feedback mechanism within a video generation loop}, where grounding outputs become inputs for subsequent generation.
+
+A separate but related issue is \textbf{generation scheduling}---the order in which shots are produced.
+All existing multi-shot systems implicitly assume narrative order: Shot~1 $\to$ Shot~2 $\to$ $\cdots$ $\to$ Shot~$N$.
+This assumption ignores a critical observation: \emph{not all shots are equally informative for grounding}.
+A close-up shot yields far higher-quality entity references than a wide establishing shot, because characters occupy more pixels and faces are more frontal.
+If the best close-up of a character appears in Shot~5 while the character first appears in a wide shot in Shot~1, narrative-order generation forces the system to establish its reference bank from the worst possible source.
+We propose \textbf{quality-aware DAG scheduling}, where an LLM predicts grounding quality for each shot-entity pair and constructs a dependency DAG that prioritizes high-quality reference sources.
+This reordering---generating informative shots first regardless of narrative position---is unique to our approach and directly enabled by our agentic formulation, where the scheduler can reason about expected reference quality and dynamically plan the optimal execution order.
 
 \section{Method}
 
@@ -172,6 +255,26 @@ If $\Delta Q < \tau_{\text{benefit}}$ (default 0.15), the improvement is negligi
 \end{itemize}
 
 The scheduler recognizes that Shot~3 is the only viable reference source for ``Chen''. Even though narratively the reveal should be delayed, we generate Shot~3 first to establish Chen's appearance, then use that reference to ensure the ``mysterious figure'' in Shots~1--2 is visually consistent with the revealed identity.
+
+\textbf{T2I Fallback for Extreme Cases.} While DAG scheduling significantly improves reference quality, some scripts present fundamental challenges: an entity may appear only in silhouette, from behind, or heavily occluded across \emph{all} shots. In such cases, even optimal scheduling cannot yield a high-quality grounding reference.
+
+We address this with a \textbf{T2I Fallback Agent} that operates in two phases:
+
+\begin{enumerate}
+    \item \textbf{Pre-Execution Quality Assessment.} Before generation, the LLM analyzes the quality matrix and assigns each entity a \emph{fallback budget}:
+    \begin{equation}
+    B_e = \begin{cases}
+        0 & \text{if } Q^*_e < \tau_{\text{immediate}} \quad \text{(direct T2I)} \\
+        1 & \text{if } \tau_{\text{immediate}} \le Q^*_e < \tau_{\text{normal}} \quad \text{(low budget)} \\
+        3 & \text{if } Q^*_e \ge \tau_{\text{normal}} \quad \text{(full budget)}
+    \end{cases}
+    \end{equation}
+    where $Q^*_e = \max_i Q(s_i, e)$ is the best predicted quality for entity $e$, with thresholds $\tau_{\text{immediate}} = 0.3$ and $\tau_{\text{normal}} = 0.5$.
+
+    \item \textbf{Execution-Time Verification.} During generation, if grounding fails to produce a usable reference after $B_e$ retry attempts, we fall back to T2I: generating an idealized reference image from the entity's text description using a text-to-image model, then proceeding with S2V generation.
+\end{enumerate}
+
+This hybrid approach preserves T2V quality advantages when possible (T2V typically produces more natural motion than S2V), while ensuring that even the most challenging scripts can complete successfully. Crucially, the T2I fallback is a \emph{last resort}: by default, the system attempts DAG-optimized generation first, falling back only when empirical evidence confirms the reference cannot be obtained through grounding.
 
 % ----------------------------------------------------------------------------
 \subsection{LLM-Based Entity Parser with Coreference}

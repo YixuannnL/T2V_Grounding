@@ -30,6 +30,7 @@ import sys
 import json
 import shutil
 import gc
+import re
 import torch
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
@@ -82,6 +83,12 @@ from experience.advisor import (
 )
 from experience.database import (
     SceneFingerprint,
+)
+# ── T2I Fallback Agent ──
+from agents.t2i_fallback_agent import (
+    T2IFallbackAgent,
+    FallbackStrategy,
+    FallbackDecision,
 )
 
 
@@ -170,6 +177,12 @@ class T2VGroundingPipeline:
         # ── 经验记忆系统参数 ──
         enable_experience_memory: bool = True,    # 是否启用经验记忆（默认开启）
         experience_db_path: str = "",             # 经验数据库路径（空则使用 output_dir/experience.db）
+        # ── T2I Fallback 参数（v2.6 新增）──
+        enable_t2i_fallback: bool = True,         # 是否启用 T2I Fallback（默认开启）
+        t2i_quality_threshold_immediate: float = 0.3,  # 低于此阈值直接 T2I
+        t2i_quality_threshold_normal: float = 0.5,     # 高于此阈值正常 DAG 流程
+        t2i_low_budget_retries: int = 1,          # 边缘 case 的 retry 次数
+        t2i_fallback_model: str = "",             # T2I 模型（空则使用默认）
     ):
         import torch
         import torch.distributed as dist
@@ -226,6 +239,14 @@ class T2VGroundingPipeline:
         self.enable_experience_memory = enable_experience_memory
         self.experience_db_path = experience_db_path or os.path.join(output_dir, "experience.db")
         self._experience_advisor = None  # 延迟初始化
+
+        # ── T2I Fallback 参数 ──
+        self.enable_t2i_fallback = enable_t2i_fallback
+        self.t2i_quality_threshold_immediate = t2i_quality_threshold_immediate
+        self.t2i_quality_threshold_normal = t2i_quality_threshold_normal
+        self.t2i_low_budget_retries = t2i_low_budget_retries
+        self.t2i_fallback_model = t2i_fallback_model
+        self._t2i_fallback_agent = None  # 延迟初始化
 
         if self.is_rank0:
             for sub in ["frames", "crops", "videos", "registry", "selected_refs", "prompts", "used_refs"]:
@@ -317,6 +338,10 @@ class T2VGroundingPipeline:
                 print(f"[Pipeline] 🎯 根因分析式重试已启用 (max_retries={self.critique_max_retries})")
             if self.enable_experience_memory:
                 print(f"[Pipeline] 📚 经验记忆系统已启用 (db={self.experience_db_path})")
+            if self.enable_t2i_fallback:
+                print(f"[Pipeline] 🔄 T2I Fallback 已启用 "
+                      f"(immediate<{self.t2i_quality_threshold_immediate}, "
+                      f"normal>={self.t2i_quality_threshold_normal})")
 
     # ── CLIP 模型加载（用于 SmartRegistry 相似度去重）───────────────────────────
 
@@ -410,6 +435,27 @@ class T2VGroundingPipeline:
                 print(f"[Pipeline] 回退到传统参考图选择模式")
                 self.ref_selection_mode = "traditional"
         return self._ref_selection_agent
+
+    @property
+    def t2i_fallback_agent(self):
+        """获取 T2I Fallback Agent（延迟初始化）"""
+        if self._t2i_fallback_agent is None and self.enable_t2i_fallback:
+            try:
+                self._t2i_fallback_agent = T2IFallbackAgent(
+                    quality_threshold_immediate=self.t2i_quality_threshold_immediate,
+                    quality_threshold_normal=self.t2i_quality_threshold_normal,
+                    default_max_retries=self.critique_max_retries,
+                    low_budget_retries=self.t2i_low_budget_retries,
+                    use_llm_decision=True,
+                    llm_model=self.dag_scheduling_model,
+                    verbose=True,
+                )
+                print(f"[Pipeline] T2IFallbackAgent 初始化成功")
+            except Exception as e:
+                print(f"[Pipeline] ⚠️ T2IFallbackAgent 初始化失败: {e}")
+                print(f"[Pipeline] T2I Fallback 功能已禁用")
+                self.enable_t2i_fallback = False
+        return self._t2i_fallback_agent
 
     @property
     def video_critic(self):
@@ -543,6 +589,10 @@ class T2VGroundingPipeline:
                 print(f"           执行顺序: {execution_order}")
                 print(f"           预期质量提升: +{schedule_result.expected_benefit.get('anchor_quality_improvement', 0):.2f}")
 
+                # ── T2I Fallback 预判：根据 DAG 预测质量决定每个实体的 fallback 策略 ──
+                if self.enable_t2i_fallback and self.t2i_fallback_agent:
+                    self._compute_t2i_fallback_decisions(schedule_result)
+
         # 广播执行顺序给其他 rank
         if self.world_size > 1 and dist.is_initialized():
             order_data = [execution_order]
@@ -583,6 +633,12 @@ class T2VGroundingPipeline:
             # 保存调度报告
             if schedule_result:
                 self._save_schedule_report(schedule_result)
+
+            # ── 保存 T2I Fallback 日志 ──
+            if self.enable_t2i_fallback and self._t2i_fallback_agent:
+                fallback_log_path = os.path.join(self.output_dir, "t2i_fallback_log.json")
+                self._t2i_fallback_agent.export_logs(fallback_log_path)
+                self._t2i_fallback_agent.print_summary()
 
             self._save_report(results)
 
@@ -703,6 +759,60 @@ class T2VGroundingPipeline:
 
         print(f"[Pipeline] 调度报告已保存: {report_path}")
 
+    def _compute_t2i_fallback_decisions(self, schedule: ScheduleResult):
+        """
+        根据 DAG 调度的质量预测，为每个实体计算 T2I Fallback 决策
+
+        这是一个预判步骤，在实际生成前就决定每个实体的 fallback 策略：
+        - 质量 < 0.3: 直接 T2I（所有镜头都是背影/遮挡）
+        - 质量 0.3-0.5: 尝试 DAG，低 retry 预算
+        - 质量 >= 0.5: 正常 DAG 流程
+        """
+        if not schedule or not schedule.reference_sources:
+            return
+
+        print(f"\n[Pipeline] 🔄 T2I Fallback 预判分析...")
+        print(f"{'='*70}")
+
+        # 从 DAG 调度结果中提取所有实体
+        entities_in_schedule = set()
+        for shot_id, entity_scores in schedule.quality_matrix.items():
+            entities_in_schedule.update(entity_scores.keys())
+
+        # 为每个实体计算 fallback 决策
+        for entity_id in entities_in_schedule:
+            # 获取实体类型（从 reference_sources 推断，或默认 character）
+            entity_type = "character"  # 默认
+            if entity_id.startswith("obj_"):
+                entity_type = "object"
+            elif entity_id.startswith("loc_"):
+                entity_type = "location"
+
+            # 获取实体描述（暂时用 entity_id）
+            entity_description = entity_id
+
+            # 调用 agent 进行预判
+            decision = self.t2i_fallback_agent.pre_execution_decision(
+                entity_id=entity_id,
+                entity_type=entity_type,
+                entity_description=entity_description,
+                schedule_result=schedule,
+            )
+
+            # 将决策存储到 pipeline 的状态中，供后续 _process_shot 使用
+            if not hasattr(self, '_fallback_decisions'):
+                self._fallback_decisions = {}
+            self._fallback_decisions[entity_id] = decision
+
+        print(f"{'='*70}")
+        print(f"[Pipeline] T2I Fallback 预判完成，共 {len(entities_in_schedule)} 个实体\n")
+
+    def get_fallback_decision(self, entity_id: str) -> Optional[FallbackDecision]:
+        """获取指定实体的 fallback 决策"""
+        if hasattr(self, '_fallback_decisions'):
+            return self._fallback_decisions.get(entity_id)
+        return None
+
     def _process_shot(self, shot: ShotConfig) -> Optional[ShotResult]:
         import torch.distributed as dist
 
@@ -738,7 +848,14 @@ class T2VGroundingPipeline:
                 "arm", "arms", "shoulder",
                 "back", "torso",
             ]
-            is_body_part_closeup = is_closeup and any(kw in shot_text_lower for kw in body_part_keywords)
+            # 【BUG FIX】使用单词边界匹配，避免 "background" 中的 "back" 被误匹配
+            def _has_body_part_keyword(text: str, keywords: list) -> bool:
+                for kw in keywords:
+                    # \b 表示单词边界，确保完整单词匹配
+                    if re.search(rf'\b{re.escape(kw)}\b', text):
+                        return True
+                return False
+            is_body_part_closeup = is_closeup and _has_body_part_keyword(shot_text_lower, body_part_keywords)
             if is_body_part_closeup:
                 print(f"[Pipeline] 检测到局部特写镜头（身体部位），将跳过 character 人脸参考图")
 
@@ -1500,12 +1617,12 @@ class T2VGroundingPipeline:
         #   │   └── ...
         #   ├── summary.json               # 整体汇总
         #   └── critique.log               # 完整日志
-        critique_debug_dir = None
+        # 【重要】所有 rank 都需要知道 critique_debug_dir，因为 generator.generate() 需要 output_path
+        critique_debug_dir = os.path.join(
+            self.output_dir, "critique_debug", f"shot_{shot.shot_id:03d}"
+        )
         critique_log_file = None
         if self.is_rank0:
-            critique_debug_dir = os.path.join(
-                self.output_dir, "critique_debug", f"shot_{shot.shot_id:03d}"
-            )
             os.makedirs(critique_debug_dir, exist_ok=True)
 
             # ── 保存参考图到 ref_images/ 子目录 ────────────────────────────────
@@ -1555,6 +1672,9 @@ class T2VGroundingPipeline:
             "seed": self.generator.config.seed,
         }
 
+        # 【BUG FIX】追踪当前使用的 prompt，每次重试可能会修改
+        current_prompt = prompt  # 初始为原始 prompt
+
         for attempt in range(self.critique_max_retries + 1):
             # ── Step 1: Rank 0 执行 VLM Critique ──
             if self.is_rank0:
@@ -1572,6 +1692,15 @@ class T2VGroundingPipeline:
                 # ── 保存该次尝试的调试信息 ──────────────────────────────────────
                 attempt_dir = os.path.join(critique_debug_dir, f"attempt_{attempt + 1}")
                 os.makedirs(attempt_dir, exist_ok=True)
+
+                # 0. 保存当前使用的 prompt（便于 debug）
+                prompt_file = os.path.join(attempt_dir, "prompt.txt")
+                with open(prompt_file, "w", encoding="utf-8") as f:
+                    f.write(f"=== Attempt {attempt + 1} Prompt ===\n")
+                    f.write(f"Shot: {shot.shot_id}\n")
+                    f.write(f"Is Modified: {current_prompt != prompt}\n")
+                    f.write(f"{'='*60}\n\n")
+                    f.write(current_prompt)
 
                 # 1. 复制当前视频到调试目录
                 try:
@@ -1711,7 +1840,7 @@ class T2VGroundingPipeline:
                                 retry_params, new_prompt = self.smart_retry_executor.apply_strategy(
                                     strategy=strategy,
                                     current_params=current_params,
-                                    current_prompt=prompt,
+                                    current_prompt=current_prompt,  # 【BUG FIX】使用当前 prompt 而不是原始 prompt
                                     shot_id=shot.shot_id,
                                     entity_counts=entity_count_dict,
                                 )
@@ -1722,13 +1851,17 @@ class T2VGroundingPipeline:
                                     "actions": [a.value for a in strategy.actions],
                                     "reasoning": strategy.reasoning,
                                     "diagnosis_summary": diagnosis.diagnosis_summary,
+                                    "prompt_modified": new_prompt != current_prompt,  # 记录 prompt 是否被修改
                                 }
                                 with open(os.path.join(attempt_dir, "strategy.json"), "w", encoding="utf-8") as f:
                                     json.dump(strategy_info, f, ensure_ascii=False, indent=2)
                                 critique_log_file.write(f"Smart Retry Strategy: {strategy.target_category.value}\n")
                                 critique_log_file.write(f"Actions: {[a.value for a in strategy.actions]}\n")
+                                if new_prompt != current_prompt:
+                                    critique_log_file.write(f"Prompt modified: YES\n")
                             else:
                                 # 无可用策略，回退到原有逻辑
+                                new_prompt = current_prompt  # 保持 prompt 不变
                                 repair_generator = RepairStrategyGenerator()
                                 retry_params = repair_generator.generate_repair_params(
                                     critique_result=critique_result,
@@ -1736,6 +1869,7 @@ class T2VGroundingPipeline:
                                 )
                         else:
                             # SmartRetryExecutor 不可用，回退
+                            new_prompt = current_prompt  # 保持 prompt 不变
                             repair_generator = RepairStrategyGenerator()
                             retry_params = repair_generator.generate_repair_params(
                                 critique_result=critique_result,
@@ -1743,6 +1877,7 @@ class T2VGroundingPipeline:
                             )
                     else:
                         # 原有逻辑：使用 RepairStrategyGenerator
+                        new_prompt = current_prompt  # 保持 prompt 不变
                         repair_generator = RepairStrategyGenerator()
                         retry_params = repair_generator.generate_repair_params(
                             critique_result=critique_result,
@@ -1764,20 +1899,33 @@ class T2VGroundingPipeline:
                         json.dump(retry_params, f, ensure_ascii=False, indent=2)
                     critique_log_file.write(f"Retry params: {retry_params}\n")
 
-                # 准备广播数据: [need_retry, retry_params, final_video_path, best_score]
-                broadcast_data = [need_retry, retry_params, final_video_path, best_score]
+                    # 【BUG FIX】保存下一次尝试将使用的 prompt
+                    if new_prompt != current_prompt:
+                        next_prompt_file = os.path.join(attempt_dir, "next_prompt.txt")
+                        with open(next_prompt_file, "w", encoding="utf-8") as f:
+                            f.write(f"=== Next Attempt Prompt (Modified) ===\n")
+                            f.write(f"{'='*60}\n\n")
+                            f.write(new_prompt)
+                        critique_log_file.write(f"Next prompt saved to: {next_prompt_file}\n")
+
+                # 准备广播数据: [need_retry, retry_params, final_video_path, best_score, new_prompt]
+                broadcast_data = [need_retry, retry_params, final_video_path, best_score, new_prompt if need_retry else None]
             else:
-                broadcast_data = [None, None, None, None]
+                broadcast_data = [None, None, None, None, None]
 
             # ── Step 2: 广播重试决策给所有 rank ──
             if self.world_size > 1 and dist.is_initialized():
                 dist.broadcast_object_list(broadcast_data, src=0)
 
-            need_retry, retry_params, final_video_path, best_score = broadcast_data
+            need_retry, retry_params, final_video_path, best_score, new_prompt = broadcast_data
 
             # 不需要重试，退出循环
             if not need_retry:
                 break
+
+            # 【BUG FIX】更新 current_prompt 为新 prompt（所有 rank 都需要更新）
+            if new_prompt is not None:
+                current_prompt = new_prompt
 
             # ── Step 3: 所有 rank 一起重新生成视频 ──
             if retry_params:
@@ -1813,9 +1961,10 @@ class T2VGroundingPipeline:
                     print(f"[Critique] 参数调整: {', '.join(params_changed)}")
                     critique_log_file.write(f"Params changed: {', '.join(params_changed)}\n")
 
+            # 重试视频保存到 critique_debug 目录，不污染 videos/ 目录
             retry_video_path = os.path.join(
-                self.output_dir, "videos",
-                f"shot_{shot.shot_id:03d}_critique_retry{attempt + 1}.mp4"
+                critique_debug_dir,
+                f"attempt_{attempt + 2}_video.mp4"  # attempt+2 因为 attempt 从 0 开始，且这是下一次尝试
             )
 
             # 清理 VRAM（所有 rank 都执行）
@@ -1823,13 +1972,17 @@ class T2VGroundingPipeline:
 
             if self.is_rank0:
                 print(f"[Critique] 重新生成视频...")
+                if current_prompt != prompt:
+                    print(f"[Critique] 使用修改后的 prompt (已增强)")
                 critique_log_file.write(f"Regenerating video: {retry_video_path}\n")
+                critique_log_file.write(f"Using modified prompt: {current_prompt != prompt}\n")
                 critique_log_file.flush()
 
             try:
                 # 【关键】所有 rank 一起调用 generate()，保持 NCCL 同步
+                # 【BUG FIX】使用 current_prompt 而不是原始 prompt
                 self.generator.generate(
-                    text_prompt=prompt,
+                    text_prompt=current_prompt,
                     references=all_ref_images,
                     output_path=retry_video_path,
                 )
@@ -1859,6 +2012,24 @@ class T2VGroundingPipeline:
             "critique_history": critique_history,
             "debug_dir": critique_debug_dir,  # 添加调试目录到元数据
         }
+
+        # ── 确保最终视频在 videos/ 目录下 ─────────────────────────────────────────
+        final_output = os.path.join(
+            self.output_dir, "videos", f"shot_{shot.shot_id:03d}.mp4"
+        )
+
+        # 选择最佳视频作为输出
+        if best_score > (critique_history[-1]["score"] if critique_history else 0):
+            source_video = best_video_path
+            if self.is_rank0:
+                print(f"[Critique] 使用最佳结果 (score={best_score:.2f})")
+        else:
+            source_video = final_video_path
+
+        # 如果源视频不在 videos/ 目录下，复制过去
+        if self.is_rank0 and os.path.abspath(source_video) != os.path.abspath(final_output):
+            shutil.copy2(source_video, final_output)
+        final_video_path = final_output
 
         # ── 保存汇总信息并关闭日志 ────────────────────────────────────────────
         if self.is_rank0 and critique_debug_dir:
@@ -1993,6 +2164,12 @@ class T2VGroundingPipeline:
         """
         print(f"\n[Critique] ── 开始 Self-Critique 循环 (Shot {shot.shot_id}) ──")
 
+        # 创建调试目录
+        critique_debug_dir = os.path.join(
+            self.output_dir, "critique_debug", f"shot_{shot.shot_id:03d}"
+        )
+        os.makedirs(critique_debug_dir, exist_ok=True)
+
         critique_history = []
         repair_generator = RepairStrategyGenerator()
 
@@ -2124,10 +2301,10 @@ class T2VGroundingPipeline:
             if params_changed:
                 print(f"[Critique] 参数调整: {', '.join(params_changed)}")
 
-            # Step 5: 重新生成视频
+            # Step 5: 重新生成视频（保存到 critique_debug 目录）
             retry_video_path = os.path.join(
-                self.output_dir, "videos",
-                f"shot_{shot.shot_id:03d}_critique_retry{attempt + 1}.mp4"
+                critique_debug_dir,
+                f"attempt_{attempt + 2}_video.mp4"  # attempt+2 因为 attempt 从 0 开始，且这是下一次尝试
             )
 
             # 【关键修复】重新生成前清理 VRAM，防止 OOM
@@ -2173,15 +2350,24 @@ class T2VGroundingPipeline:
             "critique_history": critique_history,
         }
 
-        # 如果最终使用的不是最佳视频，复制最佳视频为最终输出
-        if final_video_path != best_video_path and best_score > critique_history[-1]["score"]:
-            import shutil
-            final_output = os.path.join(
-                self.output_dir, "videos", f"shot_{shot.shot_id:03d}.mp4"
-            )
-            shutil.copy2(best_video_path, final_output)
-            final_video_path = final_output
+        # 确保最终视频在 videos/ 目录下
+        # 如果最终视频在 critique_debug 目录，或者使用了最佳结果，都需要复制
+        final_output = os.path.join(
+            self.output_dir, "videos", f"shot_{shot.shot_id:03d}.mp4"
+        )
+
+        # 选择最佳视频作为输出
+        if best_score > critique_history[-1]["score"]:
+            source_video = best_video_path
             print(f"[Critique] 使用最佳结果 (score={best_score:.2f})")
+        else:
+            source_video = final_video_path
+
+        # 如果源视频不在 videos/ 目录下，复制过去
+        if os.path.abspath(source_video) != os.path.abspath(final_output):
+            import shutil
+            shutil.copy2(source_video, final_output)
+        final_video_path = final_output
 
         print(f"[Critique] ── Self-Critique 完成 (最终分数: {best_score:.2f}) ──\n")
 

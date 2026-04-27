@@ -39,7 +39,7 @@ outputs/
 output/
 output_demo/
 runs/
-
+output_*/
 # Optional: ignore datasets
 data/
 datasets/

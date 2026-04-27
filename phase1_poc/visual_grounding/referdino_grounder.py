@@ -350,6 +350,11 @@ class ReferDINOGrounder:
             ]
             → joint_caption = "woman in white bee suit . boy in white bee suit"
 
+        【重要修复】Location 背景提取：
+            对于 location 类型的实体，不使用 ReferDINO 对 location 描述检测出的 mask，
+            而是合并同一帧中所有前景实体（character, object）的 mask，然后 inpaint 移除前景。
+            这样才能得到干净的背景，而不是带有人物的场景图。
+
         Args:
             frame_paths: 视频帧图像路径列表
             entities: 实体列表
@@ -367,9 +372,22 @@ class ReferDINOGrounder:
         if not entities or not frame_paths:
             return result
 
-        # 构建联合 caption
-        joint_caption = " . ".join([e["text"].lower().strip() for e in entities])
-        print(f"[ReferDINO] 联合检测 caption: {joint_caption}")
+        # ── 分离前景实体和 location 实体 ─────────────────────────────────────────
+        foreground_entities = [e for e in entities if e.get("type", "character") != "location"]
+        location_entities = [e for e in entities if e.get("type", "character") == "location"]
+
+        # 如果没有前景实体，只有 location，则跳过（无法提取背景）
+        if not foreground_entities and location_entities:
+            print(f"[ReferDINO] ⚠️ 只有 location 实体，没有前景实体，无法提取干净背景")
+            return result
+
+        # ── 只对前景实体构建联合 caption ─────────────────────────────────────────
+        # Location 不参与检测，它的背景图是通过 inpaint 前景得到的
+        if foreground_entities:
+            joint_caption = " . ".join([e["text"].lower().strip() for e in foreground_entities])
+            print(f"[ReferDINO] 联合检测 caption (前景): {joint_caption}")
+        else:
+            joint_caption = ""
 
         # 加载所有帧
         frames_pil = []
@@ -379,81 +397,87 @@ class ReferDINOGrounder:
 
         origin_w, origin_h = frames_pil[0].size
 
-        # 预处理
-        imgs = torch.stack([self._transform(img) for img in frames_pil], dim=0)
-        imgs = imgs.to(self.device)
+        # ── 如果有前景实体，进行检测 ─────────────────────────────────────────────
+        all_foreground_masks = None  # [t, h, w] 合并后的前景 mask
 
-        from misc import nested_tensor_from_videos_list
-        samples = nested_tensor_from_videos_list(imgs[None], size_divisibility=1)
-        img_h, img_w = imgs.shape[-2:]
-        size = torch.as_tensor([int(img_h), int(img_w)]).to(self.device)
-        target = {"size": size}
+        if foreground_entities and joint_caption:
+            # 预处理
+            imgs = torch.stack([self._transform(img) for img in frames_pil], dim=0)
+            imgs = imgs.to(self.device)
 
-        video_len = len(frames_pil)
+            from misc import nested_tensor_from_videos_list
+            samples = nested_tensor_from_videos_list(imgs[None], size_divisibility=1)
+            img_h, img_w = imgs.shape[-2:]
+            size = torch.as_tensor([int(img_h), int(img_w)]).to(self.device)
+            target = {"size": size}
 
-        # 联合推理
-        with torch.no_grad():
-            from torch.cuda.amp import autocast
-            with autocast(self.enable_amp):
-                outputs = self._model.infer(samples, [joint_caption], [target])
+            # 联合推理
+            with torch.no_grad():
+                from torch.cuda.amp import autocast
+                with autocast(self.enable_amp):
+                    outputs = self._model.infer(samples, [joint_caption], [target])
 
-        pred_logits = outputs["pred_logits"][0]  # [t, q, k]
-        pred_masks = outputs["pred_masks"][0]    # [t, q, h, w]
-        pred_boxes = outputs["pred_boxes"][0]    # [t, q, 4]
+            pred_logits = outputs["pred_logits"][0]  # [t, q, k]
+            pred_masks = outputs["pred_masks"][0]    # [t, q, h, w]
+            pred_boxes = outputs["pred_boxes"][0]    # [t, q, 4]
 
-        # 选择 top-k queries（每个 entity 一个）
-        num_entities = len(entities)
-        pred_scores = pred_logits.sigmoid().mean(0)  # [q, K]
-        max_scores, _ = pred_scores.max(-1)          # [q,]
+            # 选择 top-k queries（每个 entity 一个）
+            num_fg_entities = len(foreground_entities)
+            pred_scores = pred_logits.sigmoid().mean(0)  # [q, K]
+            max_scores, _ = pred_scores.max(-1)          # [q,]
 
-        # 取 top-k 个 query
-        topk_scores, topk_indices = max_scores.topk(min(num_entities, max_scores.size(0)))
+            # 取 top-k 个 query
+            topk_scores, topk_indices = max_scores.topk(min(num_fg_entities, max_scores.size(0)))
 
-        # 为每个 entity 分配最近的 query（基于 bbox 位置）
-        # 这里简化处理：按顺序分配
-        for entity_idx, entity in enumerate(entities):
-            if entity_idx >= len(topk_indices):
-                break
-
-            query_idx = topk_indices[entity_idx].item()
-            entity_id = entity["entity_id"]
-            entity_type = entity.get("type", "character")
-            confidence = topk_scores[entity_idx].item()
-
-            entity_output_dir = os.path.join(output_dir, entity_id)
-            os.makedirs(entity_output_dir, exist_ok=True)
-
-            # 提取该 query 的 mask 和 bbox
-            entity_masks = pred_masks[:, query_idx, ...]  # [t, h, w]
-            entity_boxes = pred_boxes[:, query_idx, :].cpu().numpy()  # [t, 4]
-
-            # 处理 mask
-            entity_masks = entity_masks.unsqueeze(0)
-            entity_masks = entity_masks[:, :, :img_h, :img_w].cpu()
-            entity_masks = F.interpolate(
-                entity_masks,
-                size=(origin_h, origin_w),
-                mode='bilinear',
-                align_corners=False
+            # 初始化合并后的前景 mask（用于 location 背景提取）
+            all_foreground_masks = torch.zeros(
+                (len(frames_pil), origin_h, origin_w),
+                dtype=torch.bool
             )
-            entity_masks = (entity_masks.sigmoid() > self.mask_threshold).squeeze(0).numpy()
 
-            # 处理每一帧
-            for t, (frame_path, frame_pil) in enumerate(zip(frame_paths, frames_pil)):
-                mask = entity_masks[t]
-                box_cxcywh = entity_boxes[t]
-                bbox = self._cxcywh_to_xyxy(box_cxcywh, origin_w, origin_h)
+            # 为每个前景 entity 分配最近的 query
+            for entity_idx, entity in enumerate(foreground_entities):
+                if entity_idx >= len(topk_indices):
+                    break
 
-                if mask.sum() == 0:
-                    continue
+                query_idx = topk_indices[entity_idx].item()
+                entity_id = entity["entity_id"]
+                entity_type = entity.get("type", "character")
+                confidence = topk_scores[entity_idx].item()
 
-                if entity_type == "location":
-                    crop_img = self._extract_background(np.array(frame_pil), mask)
-                    crop_path = os.path.join(
-                        entity_output_dir,
-                        f"{entity_id}_{Path(frame_path).stem}_bg.jpg"
-                    )
-                else:
+                entity_output_dir = os.path.join(output_dir, entity_id)
+                os.makedirs(entity_output_dir, exist_ok=True)
+
+                # 提取该 query 的 mask 和 bbox
+                entity_masks = pred_masks[:, query_idx, ...]  # [t, h, w]
+                entity_boxes = pred_boxes[:, query_idx, :].cpu().numpy()  # [t, 4]
+
+                # 处理 mask
+                entity_masks = entity_masks.unsqueeze(0)
+                entity_masks = entity_masks[:, :, :img_h, :img_w].cpu()
+                entity_masks = F.interpolate(
+                    entity_masks,
+                    size=(origin_h, origin_w),
+                    mode='bilinear',
+                    align_corners=False
+                )
+                entity_masks = (entity_masks.sigmoid() > self.mask_threshold).squeeze(0)  # [t, h, w]
+
+                # ── 累积到 all_foreground_masks（用于后续 location 背景提取）────────
+                all_foreground_masks = all_foreground_masks | entity_masks
+
+                entity_masks_np = entity_masks.numpy()
+
+                # 处理每一帧
+                for t, (frame_path, frame_pil) in enumerate(zip(frame_paths, frames_pil)):
+                    mask = entity_masks_np[t]
+                    box_cxcywh = entity_boxes[t]
+                    bbox = self._cxcywh_to_xyxy(box_cxcywh, origin_w, origin_h)
+
+                    if mask.sum() == 0:
+                        continue
+
+                    # 前景实体：提取前景，白底
                     crop_img = self._extract_foreground_with_mask(
                         np.array(frame_pil), mask, bbox
                     )
@@ -462,19 +486,121 @@ class ReferDINOGrounder:
                         f"{entity_id}_{Path(frame_path).stem}_crop.jpg"
                     )
 
-                cv2.imwrite(crop_path, cv2.cvtColor(crop_img, cv2.COLOR_RGB2BGR))
+                    cv2.imwrite(crop_path, cv2.cvtColor(crop_img, cv2.COLOR_RGB2BGR))
 
-                result.add_result(entity_id, GroundingResult(
-                    entity_id=entity_id,
-                    frame_path=frame_path,
-                    crop_path=crop_path,
-                    bbox=bbox,
-                    score=confidence,
-                    has_mask=True,
-                    frame_idx=t,
-                ))
+                    result.add_result(entity_id, GroundingResult(
+                        entity_id=entity_id,
+                        frame_path=frame_path,
+                        crop_path=crop_path,
+                        bbox=bbox,
+                        score=confidence,
+                        has_mask=True,
+                        frame_idx=t,
+                    ))
+
+        # ── 处理 location 实体：用合并后的前景 mask 来 inpaint ─────────────────────
+        if location_entities and all_foreground_masks is not None:
+            all_foreground_masks_np = all_foreground_masks.numpy()
+
+            for location_entity in location_entities:
+                entity_id = location_entity["entity_id"]
+                entity_output_dir = os.path.join(output_dir, entity_id)
+                os.makedirs(entity_output_dir, exist_ok=True)
+
+                # 对每一帧提取背景
+                for t, (frame_path, frame_pil) in enumerate(zip(frame_paths, frames_pil)):
+                    fg_mask = all_foreground_masks_np[t]
+                    frame_np = np.array(frame_pil)
+
+                    # 计算前景 mask 覆盖率
+                    mask_coverage = fg_mask.sum() / (fg_mask.shape[0] * fg_mask.shape[1])
+
+                    # 如果没有前景 mask 或覆盖率过低，尝试 fallback 到人脸检测
+                    if fg_mask.sum() == 0 or mask_coverage < 0.01:
+                        print(f"[ReferDINO] ⚠️ 帧 {t} 前景 mask 覆盖率过低 ({mask_coverage:.2%})，"
+                              f"尝试 fallback 人脸检测...")
+                        fg_mask = self._fallback_face_detection_mask(frame_np)
+                        if fg_mask is None or fg_mask.sum() == 0:
+                            print(f"[ReferDINO] ⚠️ 帧 {t} fallback 也失败，跳过 location 背景提取")
+                            continue
+
+                    # 用合并后的前景 mask 来 inpaint
+                    bg_img = self._extract_background(frame_np, fg_mask)
+                    crop_path = os.path.join(
+                        entity_output_dir,
+                        f"{entity_id}_{Path(frame_path).stem}_bg.jpg"
+                    )
+
+                    cv2.imwrite(crop_path, cv2.cvtColor(bg_img, cv2.COLOR_RGB2BGR))
+
+                    # 计算 location 的 "bbox"（其实是整个画面）
+                    bbox = (0, 0, origin_w, origin_h)
+
+                    result.add_result(entity_id, GroundingResult(
+                        entity_id=entity_id,
+                        frame_path=frame_path,
+                        crop_path=crop_path,
+                        bbox=bbox,
+                        score=0.5,  # location 的置信度固定为中等
+                        has_mask=True,
+                        frame_idx=t,
+                    ))
+
+                print(f"[ReferDINO] ✅ Location '{entity_id}' 背景提取完成 "
+                      f"(使用 {len(foreground_entities)} 个前景实体的合并 mask)")
 
         return result
+
+    def _fallback_face_detection_mask(
+        self,
+        image_rgb: np.ndarray,
+        expansion_ratio: float = 2.5,
+    ) -> Optional[np.ndarray]:
+        """
+        当 ReferDINO 前景检测失败时，使用人脸检测作为 fallback
+
+        检测到人脸后，将 bbox 扩展为更大区域（假设人物占据人脸周围的区域）
+        """
+        try:
+            # 尝试使用 OpenCV 的人脸检测
+            face_cascade = cv2.CascadeClassifier(
+                cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+            )
+            gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+            faces = face_cascade.detectMultiScale(gray, 1.1, 4, minSize=(30, 30))
+
+            if len(faces) == 0:
+                # 尝试侧脸检测
+                profile_cascade = cv2.CascadeClassifier(
+                    cv2.data.haarcascades + 'haarcascade_profileface.xml'
+                )
+                faces = profile_cascade.detectMultiScale(gray, 1.1, 4, minSize=(30, 30))
+
+            if len(faces) == 0:
+                return None
+
+            h, w = image_rgb.shape[:2]
+            mask = np.zeros((h, w), dtype=np.uint8)
+
+            for (x, y, fw, fh) in faces:
+                # 扩展人脸区域，假设人物身体在人脸下方
+                cx, cy = x + fw // 2, y + fh // 2
+                expanded_w = int(fw * expansion_ratio)
+                expanded_h = int(fh * expansion_ratio * 1.5)  # 身体比脸长
+
+                x1 = max(0, cx - expanded_w // 2)
+                y1 = max(0, y - int(fh * 0.3))  # 头顶留一点
+                x2 = min(w, cx + expanded_w // 2)
+                y2 = min(h, cy + expanded_h)
+
+                mask[y1:y2, x1:x2] = 1
+
+            print(f"[ReferDINO] Fallback 检测到 {len(faces)} 个人脸，生成扩展 mask")
+            return mask.astype(bool)
+
+        except Exception as e:
+            print(f"[ReferDINO] ⚠️ Fallback 人脸检测失败: {e}")
+            return None
 
     def _cxcywh_to_xyxy(
         self,

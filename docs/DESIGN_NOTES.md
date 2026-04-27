@@ -21,6 +21,8 @@
 13. [Agentic DAG Scheduling (v2.5)](#13-agentic-dag-scheduling-v25)
 14. [Root Cause Analysis Retry (v4.1)](#14-root-cause-analysis-retry-v41)
 15. [Experience Memory System (v4.2)](#15-experience-memory-system-v42)
+16. [Anchor Strategy Fix (v4.3)](#16-anchor-strategy-fix-v43)
+17. [Location Background Extraction Fallback (v4.3)](#17-location-background-extraction-fallback-v43)
 
 ---
 
@@ -1619,6 +1621,115 @@ def _generate_with_critique_distributed(self, shot, ...):
 | v4.0 | 2026-04-21 | Self-Critique & Reflection Loop |
 | v4.1 | 2026-04-23 | Root Cause Analysis Retry |
 | v4.2 | 2026-04-23 | Experience Memory System |
+| v4.3 | 2026-04-24 | **Anchor Strategy Fix**, **Location Background Fallback** |
+
+---
+
+## 16. Anchor Strategy Fix (v4.3)
+
+### 问题发现
+
+**场景**：夜骑 5 镜头脚本，DAG 调度执行顺序为 [3, 5, 1, 2, 4]
+
+**现象**：Shot 4 使用的人物 ref 来自 Shot 5，而不是更早生成的 Shot 3。Shot 3 的 ref 明显质量更高（明亮、正面）。
+
+**数据证据**：
+```sql
+-- Registry 中的记录
+char_001|3|...frame_000048_crop.jpg|0.903|0.844|1  -- is_anchor=1
+char_001|5|...frame_000048_crop.jpg|0.920|0.839|0  -- is_anchor=0
+```
+
+Shot 3 被正确标记为 anchor，但 pipeline 仍然选择了 Shot 5 的 ref。
+
+### 根因分析
+
+```
+Pipeline 调用: registry.query(anchor_strategy="earliest_good")
+
+SmartRegistry.query() 方法:
+    if anchor_strategy == "earliest_high_quality":
+        order = "is_anchor DESC, shot_id ASC, ..."
+    elif anchor_strategy == "best_quality":
+        order = "is_anchor DESC, quality_score DESC, ..."
+    else:  # 默认分支
+        order = "is_anchor DESC, shot_id DESC, ..."  ← 问题！shot_id DESC = 最新优先
+
+"earliest_good" 不在列表中 → fallback 到默认分支
+→ shot_id DESC 导致更新的 Shot 5 被优先选择
+```
+
+### 解决方案
+
+修改 `smart_registry.py` 的 `query()` 方法，让 `earliest_good` 也使用正确的排序：
+
+```python
+# 修复前
+if anchor_strategy == "earliest_high_quality":
+    order = "is_anchor DESC, shot_id ASC, quality_score DESC"
+elif anchor_strategy == "best_quality":
+    order = "is_anchor DESC, quality_score DESC, shot_id ASC"
+else:
+    order = "is_anchor DESC, shot_id DESC, quality_score DESC"  # BUG!
+
+# 修复后
+if anchor_strategy == "earliest_high_quality" or anchor_strategy == "earliest_good":
+    order = "is_anchor DESC, shot_id ASC, quality_score DESC"
+elif anchor_strategy == "best_quality":
+    order = "is_anchor DESC, quality_score DESC, shot_id ASC"
+else:
+    order = "is_anchor DESC, shot_id ASC, quality_score DESC"  # 默认也是早期优先
+```
+
+---
+
+## 17. Location Background Extraction Fallback (v4.3)
+
+### 问题发现
+
+**场景**：夜景 close-up 镜头，需要提取 location 背景图
+
+**现象**：提取的背景图 `loc_xxx_bg.jpg` 中还残留着人脸！前景没有被正确移除。
+
+**数据证据**：
+```
+Shot 1 char_001 crop: 只检测到头发/肩膀的一小部分（4KB），完全没有覆盖人脸
+Location background: 人脸清晰可见（应该被 inpaint 移除）
+```
+
+### 根因分析
+
+```
+Location 背景提取流程：
+1. 检测所有前景实体（char, object）的 mask
+2. 合并所有前景 mask
+3. 用合并后的 mask 对原图做 inpaint
+
+问题出在步骤 1：
+- ReferDINO 在夜景/暗光场景下检测质量很差
+- char_001 的 mask 只覆盖了极小区域（< 1% 画面）
+- 合并后的 mask 不包含人脸
+- inpaint 时人脸没有被移除
+```
+
+### 解决方案
+
+增加 **fallback 机制**：当前景 mask 覆盖率过低时，使用 OpenCV 人脸检测作为补充：
+
+```python
+# 计算前景 mask 覆盖率
+mask_coverage = fg_mask.sum() / (fg_mask.shape[0] * fg_mask.shape[1])
+
+# 如果覆盖率过低（< 1%），尝试 fallback
+if fg_mask.sum() == 0 or mask_coverage < 0.01:
+    print(f"[ReferDINO] ⚠️ 前景 mask 覆盖率过低 ({mask_coverage:.2%})，尝试 fallback...")
+    fg_mask = self._fallback_face_detection_mask(frame_np)
+```
+
+Fallback 方法：
+1. 使用 OpenCV Haar 级联检测器检测人脸
+2. 将人脸 bbox 扩展 2.5 倍（假设身体在人脸周围）
+3. 生成扩展后的 mask 用于 inpaint
 
 ---
 
